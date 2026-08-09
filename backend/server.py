@@ -10,6 +10,7 @@ import asyncio
 import base64
 import binascii
 import math
+import re
 import secrets
 import uuid
 import logging
@@ -1539,11 +1540,26 @@ async def get_settings(u=Depends(get_user)):
     return s
 
 
+_HM_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+def _validate_shift_time(value: Optional[str], label: str):
+    # Blank clears/disables the flag (existing behavior) — only a non-empty,
+    # malformed value is rejected. Without this, a bad save here would throw
+    # an uncaught error inside every subsequent check-in/check-out.
+    if value and not _HM_RE.match(value):
+        raise HTTPException(400, f"{label} must be in HH:MM 24-hour format (e.g. 09:00)")
+
+
 @api.put("/settings")
 async def update_settings(body: SettingsIn, u=Depends(require_role(Role.admin))):
+    _validate_shift_time(body.shift_start_time, "Shift start")
+    _validate_shift_time(body.shift_end_time, "Shift end")
+    old = await db.settings.find_one({"id": "global"}, {"_id": 0})
     upd = {k: v for k, v in body.dict().items() if v is not None}
     await db.settings.update_one({"id": "global"}, {"$set": upd}, upsert=True)
     s = await db.settings.find_one({"id": "global"}, {"_id": 0})
+    await audit(u, "update", "settings", "global", old, upd)
     return s
 
 

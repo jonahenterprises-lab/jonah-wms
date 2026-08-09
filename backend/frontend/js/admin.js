@@ -662,6 +662,7 @@ async function renderSites(content) {
         <label>Client Name<input name="client_name" required /></label>
         <label>Address<input name="address" required /></label>
         ${locationPickerHtml("add-site", null, null)}
+        <label>Geofence Radius in meters (blank = default 500m)<input name="geofence_radius_m" type="number" step="1" min="1" placeholder="500" /></label>
         <label>Contact Person<input name="contact_person" /></label>
         <label>Contact Number<input name="contact_number" /></label>
         ${doorRateOverridesHtml("add-site", doorTypes, {})}
@@ -695,6 +696,7 @@ async function renderSites(content) {
             <label>Client Name<input name="client_name" value="${escapeHtml(s.client_name)}" required /></label>
             <label>Address<input name="address" value="${escapeHtml(s.address)}" required /></label>
             ${locationPickerHtml(`edit-site-${i}`, s.latitude, s.longitude)}
+            <label>Geofence Radius in meters (blank = default 500m)<input name="geofence_radius_m" type="number" step="1" min="1" placeholder="500" value="${s.geofence_radius_m ?? ""}" /></label>
             <label>Contact Person<input name="contact_person" value="${escapeHtml(s.contact_person || "")}" /></label>
             <label>Contact Number<input name="contact_number" value="${escapeHtml(s.contact_number || "")}" /></label>
             ${doorRateOverridesHtml(`edit-site-${i}`, doorTypes, s.door_type_rates || {})}
@@ -736,6 +738,7 @@ async function renderSites(content) {
         address: fd.get("address"),
         latitude: fd.get("latitude") ? Number(fd.get("latitude")) : null,
         longitude: fd.get("longitude") ? Number(fd.get("longitude")) : null,
+        geofence_radius_m: fd.get("geofence_radius_m") ? Number(fd.get("geofence_radius_m")) : null,
         contact_person: fd.get("contact_person"),
         contact_number: fd.get("contact_number"),
         door_type_rates: collectDoorRateOverrides(e.target, "add-site", doorTypes),
@@ -774,6 +777,7 @@ async function renderSites(content) {
           address: fd.get("address"),
           latitude: fd.get("latitude") ? Number(fd.get("latitude")) : null,
           longitude: fd.get("longitude") ? Number(fd.get("longitude")) : null,
+          geofence_radius_m: fd.get("geofence_radius_m") ? Number(fd.get("geofence_radius_m")) : null,
           contact_person: fd.get("contact_person"),
           contact_number: fd.get("contact_number"),
           status: fd.get("status"),

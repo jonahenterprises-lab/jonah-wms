@@ -160,6 +160,7 @@ class SiteIn(BaseModel):
     door_type_rates: dict = {}  # {door_type_id: rate} — per-site override of a door type's default rate
     target_doors: dict = {}  # {door_type_id: assigned_count} — omitted key = no ceiling for that type
     assigned_worker_ids: List[str] = []  # empty = open to every worker (unchanged legacy behavior)
+    geofence_radius_m: Optional[int] = None  # unset = fall back to the global default
 
 
 class DoorTypeIn(BaseModel):
@@ -318,7 +319,7 @@ async def get_effective_rate(worker_id: str, site_id: str) -> float:
     return 250.0
 
 
-GEOFENCE_WARNING_METERS = 500  # generous buffer over typical phone GPS drift (10-50m)
+GEOFENCE_WARNING_METERS = 500  # default when a site has no geofence_radius_m of its own
 IST = timezone(timedelta(hours=5, minutes=30))  # the business operates in India only
 
 
@@ -791,7 +792,7 @@ async def check_in(body: CheckInIn, u=Depends(require_role(Role.worker, Role.adm
     geo_warning = False
     if site.get("latitude") is not None and site.get("longitude") is not None:
         geo_distance_m = round(haversine_meters(body.latitude, body.longitude, site["latitude"], site["longitude"]))
-        geo_warning = geo_distance_m > GEOFENCE_WARNING_METERS
+        geo_warning = geo_distance_m > (site.get("geofence_radius_m") or GEOFENCE_WARNING_METERS)
     session_id = str(uuid.uuid4())
     check_in_time = now_utc().isoformat()
     settings = await db.settings.find_one({"id": "global"}, {"_id": 0}) or {}
@@ -857,7 +858,7 @@ async def check_out(body: CheckOutIn, u=Depends(require_role(Role.worker, Role.a
     geo_warning = False
     if site and site.get("latitude") is not None and site.get("longitude") is not None:
         geo_distance_m = round(haversine_meters(body.latitude, body.longitude, site["latitude"], site["longitude"]))
-        geo_warning = geo_distance_m > GEOFENCE_WARNING_METERS
+        geo_warning = geo_distance_m > ((site or {}).get("geofence_radius_m") or GEOFENCE_WARNING_METERS)
     check_out_time = now_utc().isoformat()
     settings = await db.settings.find_one({"id": "global"}, {"_id": 0}) or {}
     early_leave_flag = False

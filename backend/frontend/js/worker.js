@@ -227,6 +227,9 @@ async function renderSites(content, user, nav) {
         if (result.check_out_geo_warning) {
           alert(`Checked out ${result.check_out_geo_distance_m}m from ${active.site_name}'s recorded location. This has been flagged for your admin to review.`);
         }
+        if (result.early_leave_flag) {
+          alert(`You checked out ${result.early_leave_by_minutes} minutes before shift end. This has been flagged for your admin.`);
+        }
         renderSites(content, user, nav);
       } catch (err) {
         errorEl.textContent = err.message;
@@ -297,6 +300,9 @@ async function renderSites(content, user, nav) {
           });
           if (result.check_in_geo_warning) {
             alert(`You're ${result.check_in_geo_distance_m}m from ${site ? site.site_name : "this site"}'s recorded location. This has been flagged for your admin to review.`);
+          }
+          if (result.late_flag) {
+            alert(`You checked in ${result.late_by_minutes} minutes after shift start. This has been flagged for your admin.`);
           }
           renderSites(content, user, nav);
         } catch (err) {

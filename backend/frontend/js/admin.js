@@ -1160,7 +1160,11 @@ async function renderAttendance(content, nav) {
             </div>
             ${a.check_out_time ? "" : statusBadge("Pending")}
           </div>
-          ${a.check_in_geo_warning || a.check_out_geo_warning ? `<div class="badge badge-warning" style="align-self:flex-start;margin-top:0.4rem">Far from site</div>` : ""}
+          <div style="display:flex;gap:0.4rem;flex-wrap:wrap;margin-top:0.4rem">
+            ${a.check_in_geo_warning || a.check_out_geo_warning ? `<div class="badge badge-warning">Far from site</div>` : ""}
+            ${a.late_flag ? `<div class="badge badge-warning">Late ${a.late_by_minutes}m</div>` : ""}
+            ${a.early_leave_flag ? `<div class="badge badge-warning">Left early ${a.early_leave_by_minutes}m</div>` : ""}
+          </div>
           ${
             a.check_out_time
               ? ""
@@ -1331,6 +1335,10 @@ async function renderSettings(content, nav) {
       <label>Email<input name="email" value="${escapeHtml(s.email || "")}" /></label>
       <label>Currency<input name="currency" value="${escapeHtml(s.currency || "₹")}" /></label>
       <label>Default Rate/Door<input name="default_rate" type="number" step="0.01" value="${s.default_rate || 250}" /></label>
+      <label>Shift Start (blank = no late flagging)<input name="shift_start_time" type="time" value="${escapeHtml(s.shift_start_time || "")}" /></label>
+      <label>Late Grace (minutes)<input name="late_grace_minutes" type="number" step="1" min="0" value="${s.late_grace_minutes ?? 15}" /></label>
+      <label>Shift End (blank = no early-leave flagging)<input name="shift_end_time" type="time" value="${escapeHtml(s.shift_end_time || "")}" /></label>
+      <label>Early Leave Grace (minutes)<input name="early_leave_grace_minutes" type="number" step="1" min="0" value="${s.early_leave_grace_minutes ?? 15}" /></label>
       <div class="error" id="settings-error"></div>
       <button type="submit" class="pill-btn">Save Settings</button>
     </form>
@@ -1349,6 +1357,10 @@ async function renderSettings(content, nav) {
         email: fd.get("email"),
         currency: fd.get("currency"),
         default_rate: Number(fd.get("default_rate")),
+        shift_start_time: fd.get("shift_start_time"),
+        shift_end_time: fd.get("shift_end_time"),
+        late_grace_minutes: Number(fd.get("late_grace_minutes")),
+        early_leave_grace_minutes: Number(fd.get("early_leave_grace_minutes")),
       });
       showMessage(content, "Settings saved", "success");
     } catch (err) {

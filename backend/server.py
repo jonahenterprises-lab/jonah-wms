@@ -231,6 +231,10 @@ class SettingsIn(BaseModel):
     currency: Optional[str] = None
     default_rate: Optional[float] = None
     logo_base64: Optional[str] = None
+    shift_start_time: Optional[str] = None  # "HH:MM", IST — unset disables late flagging
+    shift_end_time: Optional[str] = None  # "HH:MM", IST — unset disables early-leave flagging
+    late_grace_minutes: Optional[int] = None
+    early_leave_grace_minutes: Optional[int] = None
 
 
 # --- Helpers -------------------------------------------------------------
@@ -312,6 +316,20 @@ async def get_effective_rate(worker_id: str, site_id: str) -> float:
 
 
 GEOFENCE_WARNING_METERS = 500  # generous buffer over typical phone GPS drift (10-50m)
+IST = timezone(timedelta(hours=5, minutes=30))  # the business operates in India only
+
+
+def minutes_since_midnight_ist(iso_str: str) -> int:
+    dt = datetime.fromisoformat(iso_str)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    local = dt.astimezone(IST)
+    return local.hour * 60 + local.minute
+
+
+def parse_hm_to_minutes(hm: str) -> int:
+    h, m = hm.split(":")
+    return int(h) * 60 + int(m)
 
 
 def haversine_meters(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -750,23 +768,38 @@ async def check_in(body: CheckInIn, u=Depends(require_role(Role.worker, Role.adm
         geo_distance_m = round(haversine_meters(body.latitude, body.longitude, site["latitude"], site["longitude"]))
         geo_warning = geo_distance_m > GEOFENCE_WARNING_METERS
     session_id = str(uuid.uuid4())
+    check_in_time = now_utc().isoformat()
+    settings = await db.settings.find_one({"id": "global"}, {"_id": 0}) or {}
+    late_flag = False
+    late_by_minutes = None
+    if settings.get("shift_start_time"):
+        grace = settings.get("late_grace_minutes") or 0
+        checkin_mins = minutes_since_midnight_ist(check_in_time)
+        shift_start_mins = parse_hm_to_minutes(settings["shift_start_time"])
+        if checkin_mins > shift_start_mins + grace:
+            late_flag = True
+            late_by_minutes = checkin_mins - shift_start_mins
     doc = {
         "id": session_id,
         "worker_id": worker_id,
         "worker_name": u.get("name"),
         "site_id": body.site_id,
         "site_name": site["site_name"],
-        "check_in_time": now_utc().isoformat(),
+        "check_in_time": check_in_time,
         "check_in_latitude": body.latitude,
         "check_in_longitude": body.longitude,
         "check_in_accuracy": body.accuracy,
         "check_in_geo_warning": geo_warning,
         "check_in_geo_distance_m": geo_distance_m,
+        "late_flag": late_flag,
+        "late_by_minutes": late_by_minutes,
         "check_out_time": None,
         "check_out_latitude": None,
         "check_out_longitude": None,
         "check_out_geo_warning": False,
         "check_out_geo_distance_m": None,
+        "early_leave_flag": False,
+        "early_leave_by_minutes": None,
         "work_completed": None,
         "remarks": "",
         "created_at": now_utc().isoformat(),
@@ -778,6 +811,8 @@ async def check_in(body: CheckInIn, u=Depends(require_role(Role.worker, Role.adm
     msg = f"{u.get('name')} checked in at {site['site_name']}."
     if geo_warning:
         msg += f" ⚠️ {geo_distance_m}m from the site's recorded location — please verify."
+    if late_flag:
+        msg += f" ⚠️ {late_by_minutes} min late."
     async for admin in db.users.find({"role": Role.admin.value}, {"_id": 0, "id": 1}):
         await add_notification(admin["id"], "Worker Check-In", msg)
     return clean(doc)
@@ -798,13 +833,26 @@ async def check_out(body: CheckOutIn, u=Depends(require_role(Role.worker, Role.a
     if site and site.get("latitude") is not None and site.get("longitude") is not None:
         geo_distance_m = round(haversine_meters(body.latitude, body.longitude, site["latitude"], site["longitude"]))
         geo_warning = geo_distance_m > GEOFENCE_WARNING_METERS
+    check_out_time = now_utc().isoformat()
+    settings = await db.settings.find_one({"id": "global"}, {"_id": 0}) or {}
+    early_leave_flag = False
+    early_leave_by_minutes = None
+    if settings.get("shift_end_time"):
+        grace = settings.get("early_leave_grace_minutes") or 0
+        checkout_mins = minutes_since_midnight_ist(check_out_time)
+        shift_end_mins = parse_hm_to_minutes(settings["shift_end_time"])
+        if checkout_mins < shift_end_mins - grace:
+            early_leave_flag = True
+            early_leave_by_minutes = shift_end_mins - checkout_mins
     upd = {
-        "check_out_time": now_utc().isoformat(),
+        "check_out_time": check_out_time,
         "check_out_latitude": body.latitude,
         "check_out_longitude": body.longitude,
         "check_out_accuracy": body.accuracy,
         "check_out_geo_warning": geo_warning,
         "check_out_geo_distance_m": geo_distance_m,
+        "early_leave_flag": early_leave_flag,
+        "early_leave_by_minutes": early_leave_by_minutes,
         "work_completed": body.work_completed,
         "remarks": body.remarks or "",
     }
@@ -812,6 +860,8 @@ async def check_out(body: CheckOutIn, u=Depends(require_role(Role.worker, Role.a
     msg = f"{u.get('name')} checked out from {sess['site_name']}."
     if geo_warning:
         msg += f" ⚠️ {geo_distance_m}m from the site's recorded location — please verify."
+    if early_leave_flag:
+        msg += f" ⚠️ Left {early_leave_by_minutes} min early."
     async for admin in db.users.find({"role": Role.admin.value}, {"_id": 0, "id": 1}):
         await add_notification(admin["id"], "Worker Check-Out", msg)
     return {**sess, **upd}

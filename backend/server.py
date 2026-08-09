@@ -497,36 +497,35 @@ class RegisterPushIn(BaseModel):
 
 
 # --- Auth endpoints ------------------------------------------------------
-# In-process login throttle. This resets on restart and doesn't share state
-# across multiple workers/replicas — good enough as a baseline, but a real
-# multi-instance deployment should move this to Redis or similar.
+# Login throttle backed by Mongo (db.login_attempts) rather than an in-process
+# dict — a dict resets on every restart and, more importantly, doesn't share
+# state across multiple Railway instances/replicas, so an attacker spread
+# across instances would get 5 tries per instance instead of 5 total.
 LOGIN_MAX_ATTEMPTS = 5
 LOGIN_WINDOW_SECONDS = 15 * 60
-_login_attempts: dict[str, list[float]] = {}
 
 
-def _login_rate_limited(key: str) -> bool:
-    now = now_utc().timestamp()
-    attempts = [t for t in _login_attempts.get(key, []) if now - t < LOGIN_WINDOW_SECONDS]
-    _login_attempts[key] = attempts
-    return len(attempts) >= LOGIN_MAX_ATTEMPTS
+async def _login_rate_limited(key: str) -> bool:
+    cutoff = now_utc() - timedelta(seconds=LOGIN_WINDOW_SECONDS)
+    count = await db.login_attempts.count_documents({"username": key, "created_at": {"$gte": cutoff}})
+    return count >= LOGIN_MAX_ATTEMPTS
 
 
-def _record_login_failure(key: str):
-    _login_attempts.setdefault(key, []).append(now_utc().timestamp())
+async def _record_login_failure(key: str):
+    await db.login_attempts.insert_one({"username": key, "created_at": now_utc()})
 
 
 @api.post("/auth/login", response_model=TokenOut)
 async def login(body: LoginIn):
     key = body.username.lower().strip()
-    if _login_rate_limited(key):
+    if await _login_rate_limited(key):
         raise HTTPException(status_code=429, detail="Too many login attempts. Try again later.")
     u = await db.users.find_one({"username": key}, {"_id": 0})
     valid = pwd_ctx.verify(body.password, u["password_hash"]) if u else pwd_ctx.verify(body.password, DUMMY_HASH)
     if not u or not valid or u.get("disabled"):
-        _record_login_failure(key)
+        await _record_login_failure(key)
         raise HTTPException(status_code=401, detail="Incorrect username or password")
-    _login_attempts.pop(key, None)
+    await db.login_attempts.delete_many({"username": key})
     return TokenOut(access_token=issue_token(u), user=public_user(u))
 
 
@@ -2542,6 +2541,11 @@ async def startup():
     await db.workers.create_index("employee_id", unique=True)
     # TTL index so used one-time download tokens self-clean shortly after expiry
     await db.used_download_tokens.create_index("expires_at", expireAfterSeconds=0)
+    # TTL index for login throttle records — storage hygiene only; the rate-limit
+    # check itself uses an explicit time-window filter since Mongo's background
+    # TTL sweep can lag up to ~60s behind the actual expiry.
+    await db.login_attempts.create_index("created_at", expireAfterSeconds=LOGIN_WINDOW_SECONDS)
+    await db.login_attempts.create_index("username")
     # Use partial index so only actual string sync_ids are enforced unique
     # (sparse indexes do NOT skip null values — they only skip missing fields).
     for coll_name in ("attendance_sessions", "work_reports", "payments"):

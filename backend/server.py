@@ -8,6 +8,7 @@ import os
 import io
 import asyncio
 import base64
+import binascii
 import math
 import secrets
 import uuid
@@ -29,7 +30,7 @@ from fastapi.security import OAuth2PasswordBearer
 from motor.motor_asyncio import AsyncIOMotorClient
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError
 
 # --- Setup ---------------------------------------------------------------
 ROOT_DIR = Path(__file__).parent
@@ -407,6 +408,29 @@ MAX_PHOTO_B64_CHARS = 12_000_000  # ~9MB decoded — generous ceiling for a phon
 def _photo_too_large(b64_data_uri: str) -> bool:
     raw = b64_data_uri.split(",", 1)[1] if "," in b64_data_uri else b64_data_uri
     return len(raw) > MAX_PHOTO_B64_CHARS
+
+
+ALLOWED_PHOTO_FORMATS = {"JPEG", "PNG", "WEBP"}
+
+
+def _validate_photo(b64_data_uri: str, label: str) -> None:
+    """Re-validates on the server that a claimed 'photo' is actually a decodable
+    image in an allowed format, before it's trusted as evidence. Without this,
+    _watermark_photo's broad except-and-fall-back-to-original would silently
+    accept and store arbitrary non-image bytes a worker (or a compromised
+    client) submitted, unwatermarked and untagged."""
+    try:
+        raw = b64_data_uri.split(",", 1)[1] if "," in b64_data_uri else b64_data_uri
+        decoded = base64.b64decode(raw, validate=True)
+        img = Image.open(io.BytesIO(decoded))
+        img.verify()  # structural check only — img is unusable after this, which is fine, we only needed the check
+        # Re-open a fresh instance: verify() invalidates the one above but the format
+        # attribute set during the initial open() is still what we need to check.
+        fmt = img.format
+    except (UnidentifiedImageError, Image.DecompressionBombError, binascii.Error, ValueError, OSError):
+        raise HTTPException(400, f"{label} is not a valid image. Please retake the photo and try again.")
+    if fmt not in ALLOWED_PHOTO_FORMATS:
+        raise HTTPException(400, f"{label} is a {fmt or 'unknown'} file — only JPEG, PNG, or WEBP photos are accepted.")
 
 
 def _watermark_photo(b64_data_uri: str, worker_name: str, site_name: str,
@@ -950,6 +974,10 @@ async def create_report(body: WorkReportIn, u=Depends(require_role(Role.worker, 
         raise HTTPException(400, "At least 1 before and 1 after photo required")
     if any(_photo_too_large(p) for p in body.before_photos + body.after_photos):
         raise HTTPException(400, "One or more photos exceed the size limit (~9MB each)")
+    for i, p in enumerate(body.before_photos):
+        _validate_photo(p, f"Before photo {i + 1}")
+    for i, p in enumerate(body.after_photos):
+        _validate_photo(p, f"After photo {i + 1}")
     # Enforce each door type's assigned quantity at this site, if the admin set one.
     # Checked before touching photos so a worker gets fast feedback instead of a
     # rejection after already uploading evidence for a count that was never going in.

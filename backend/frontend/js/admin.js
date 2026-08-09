@@ -286,6 +286,15 @@ async function renderApprovals(content) {
         `
             : ""
         }
+        ${
+          status === "Approved"
+            ? `
+          <div class="actions" style="display:flex;gap:0.5rem;margin-top:0.6rem">
+            <button class="pill-btn outline pill-btn-sm" data-idx="${i}" data-action="unapprove">Reopen</button>
+          </div>
+        `
+            : ""
+        }
       </div>
     `
       )
@@ -297,12 +306,13 @@ async function renderApprovals(content) {
         strip.style.display = strip.style.display === "none" ? "flex" : "none";
       });
     });
-    const map = { approve: "approve", reject: "reject", correction: "correction" };
+    const map = { approve: "approve", reject: "reject", correction: "correction", unapprove: "unapprove" };
+    const promptLabel = { approve: "approving", reject: "rejecting", correction: "requesting a fix", unapprove: "reopening" };
     Object.keys(map).forEach((action) => {
       listEl.querySelectorAll(`[data-action="${action}"]`).forEach((btn) => {
         btn.addEventListener("click", async () => {
           const report = reports[Number(btn.dataset.idx)];
-          const remarks = prompt(`Remarks for ${action} (optional):`, "") || "";
+          const remarks = prompt(`Remarks for ${promptLabel[action]} (optional):`, "") || "";
           try {
             await post(`/work-reports/${report.id}/${map[action]}`, { remarks });
             load(status);
@@ -1037,6 +1047,7 @@ let _attendanceMap = null;
 
 async function renderAttendance(content, nav) {
   const sessions = await get("/attendance");
+  const shown = sessions.slice(0, 100);
   content.innerHTML = `
     <div class="back-row">
       <button class="icon-btn" id="back-btn">←</button>
@@ -1044,25 +1055,55 @@ async function renderAttendance(content, nav) {
     </div>
     <p class="page-subtitle">Check-in locations for the most recent sessions</p>
     <div class="map-container" id="attendance-map"></div>
-    ${sessions
-      .slice(0, 100)
-      .map(
-        (a) => `
-      <div class="list-card">
-        <div class="list-card-body">
-          <div class="list-card-title">${escapeHtml(a.worker_name)}</div>
-          <div class="list-card-sub">${escapeHtml(a.site_name)}</div>
-          <div class="list-card-meta">In: ${formatDateTime(a.check_in_time)} @ ${a.check_in_latitude?.toFixed(4)}, ${a.check_in_longitude?.toFixed(4)}</div>
-          ${a.check_out_time ? `<div class="list-card-meta">Out: ${formatDateTime(a.check_out_time)}</div>` : ""}
+    <div id="attendance-list">
+      ${shown
+        .map(
+          (a, i) => `
+        <div class="list-card" style="flex-direction:column;align-items:stretch">
+          <div style="display:flex;justify-content:space-between">
+            <div class="list-card-body">
+              <div class="list-card-title">${escapeHtml(a.worker_name)}</div>
+              <div class="list-card-sub">${escapeHtml(a.site_name)}</div>
+              <div class="list-card-meta">In: ${formatDateTime(a.check_in_time)} @ ${a.check_in_latitude?.toFixed(4)}, ${a.check_in_longitude?.toFixed(4)}${a.check_in_geo_warning ? ` (${a.check_in_geo_distance_m}m away ⚠️)` : ""}</div>
+              ${a.check_out_time ? `<div class="list-card-meta">Out: ${formatDateTime(a.check_out_time)}${a.check_out_geo_warning ? ` (${a.check_out_geo_distance_m}m away ⚠️)` : ""}</div>` : ""}
+            </div>
+            ${a.check_out_time ? "" : statusBadge("Pending")}
+          </div>
+          ${a.check_in_geo_warning || a.check_out_geo_warning ? `<div class="badge badge-warning" style="align-self:flex-start;margin-top:0.4rem">Far from site</div>` : ""}
+          ${
+            a.check_out_time
+              ? ""
+              : `<button class="pill-btn outline pill-btn-sm text-danger" data-idx="${i}" style="align-self:flex-start;margin-top:0.5rem">Force Check-Out</button>`
+          }
         </div>
-        ${a.check_out_time ? "" : statusBadge("Pending")}
-      </div>
-    `
-      )
-      .join("") || '<div class="empty-state">No attendance records</div>'}
+      `
+        )
+        .join("") || '<div class="empty-state">No attendance records</div>'}
+    </div>
   `;
   content.querySelector("#back-btn").addEventListener("click", () => nav.back("more"));
-  initAttendanceMap(sessions.slice(0, 100));
+  initAttendanceMap(shown);
+
+  content.querySelectorAll("[data-idx]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const sess = shown[Number(btn.dataset.idx)];
+      const remarks = prompt(
+        `Close ${sess.worker_name}'s session at ${sess.site_name}? They'll be notified. Optional remarks:`,
+        ""
+      );
+      if (remarks === null) return;
+      btn.disabled = true;
+      btn.textContent = "Closing…";
+      try {
+        await post(`/attendance/${sess.id}/force-checkout`, { remarks });
+        renderAttendance(content, nav);
+      } catch (err) {
+        showMessage(content, err.message, "error");
+        btn.disabled = false;
+        btn.textContent = "Force Check-Out";
+      }
+    });
+  });
 }
 
 function initAttendanceMap(sessions) {

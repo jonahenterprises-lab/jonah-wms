@@ -1,4 +1,4 @@
-import { get, post } from "./api.js";
+import { get, post, put, del } from "./api.js";
 import {
   getPosition,
   filesToDataUris,
@@ -216,7 +216,7 @@ async function renderSites(content, user, nav) {
       try {
         const pos = await getPosition();
         btn.textContent = "Checking out…";
-        await post("/attendance/check-out", {
+        const result = await post("/attendance/check-out", {
           session_id: active.id,
           latitude: pos.coords.latitude,
           longitude: pos.coords.longitude,
@@ -224,6 +224,9 @@ async function renderSites(content, user, nav) {
           work_completed: content.querySelector("#work-completed").checked,
           remarks: content.querySelector("#checkout-remarks").value,
         });
+        if (result.check_out_geo_warning) {
+          alert(`Checked out ${result.check_out_geo_distance_m}m from ${active.site_name}'s recorded location. This has been flagged for your admin to review.`);
+        }
         renderSites(content, user, nav);
       } catch (err) {
         errorEl.textContent = err.message;
@@ -284,13 +287,17 @@ async function renderSites(content, user, nav) {
         try {
           const pos = await getPosition();
           btn.innerHTML = "<div class='list-card-body'>Checking in…</div>";
-          await post("/attendance/check-in", {
+          const site = sites.find((s) => s.id === btn.dataset.id);
+          const result = await post("/attendance/check-in", {
             site_id: btn.dataset.id,
             latitude: pos.coords.latitude,
             longitude: pos.coords.longitude,
             accuracy: pos.coords.accuracy,
             client_sync_id: uuid(),
           });
+          if (result.check_in_geo_warning) {
+            alert(`You're ${result.check_in_geo_distance_m}m from ${site ? site.site_name : "this site"}'s recorded location. This has been flagged for your admin to review.`);
+          }
           renderSites(content, user, nav);
         } catch (err) {
           errorEl.textContent = err.message;
@@ -416,8 +423,9 @@ async function renderReportForm(content, user, nav, logout, params) {
   });
 }
 
-async function renderReports(content, user) {
-  const reports = await get("/work-reports");
+async function renderReports(content, user, nav) {
+  const [reports, doorTypes] = await Promise.all([get("/work-reports"), get("/door-types")]);
+  const editable = (r) => r.approval_status === "Pending" || r.approval_status === "Correction";
   content.innerHTML = `
     <h1 class="page-title">Work Reports</h1>
     <p class="page-subtitle">${reports.length} total</p>
@@ -448,11 +456,41 @@ async function renderReports(content, user) {
           }
           ${r.notes ? `<div class="list-card-meta">Note: ${escapeHtml(r.notes)}</div>` : ""}
           ${r.approval_remarks ? `<div class="list-card-meta">Remarks: ${escapeHtml(r.approval_remarks)}</div>` : ""}
-          <button class="btn-link" data-idx="${i}" style="align-self:flex-start;margin-top:0.4rem">View Photos</button>
+          <button class="btn-link" data-idx="${i}" data-action="photos" style="align-self:flex-start;margin-top:0.4rem">View Photos</button>
           <div class="photo-strip" id="photos-${i}" style="display:none">
             ${r.before_photos.map((p) => `<img src="${p}" alt="before" />`).join("")}
             ${r.after_photos.map((p) => `<img src="${p}" alt="after" />`).join("")}
           </div>
+          ${
+            editable(r)
+              ? `
+            <div class="actions" style="display:flex;gap:0.5rem;margin-top:0.6rem">
+              <button class="pill-btn outline pill-btn-sm" data-idx="${i}" data-action="edit">Edit</button>
+              <button class="pill-btn outline pill-btn-sm text-danger" data-idx="${i}" data-action="withdraw">Withdraw</button>
+            </div>
+            <div class="card-block" id="edit-report-${i}" style="display:none">
+              <form class="edit-report-form" data-id="${r.id}">
+                ${doorTypes
+                  .map((t) => {
+                    const existing = (r.door_breakdown || []).find((d) => d.door_type_id === t.id);
+                    return `
+                  <div style="display:flex;align-items:center;gap:0.6rem;margin-bottom:0.5rem">
+                    <span style="flex:1;font-size:0.85rem">${escapeHtml(t.name)}</span>
+                    <input type="number" min="0" step="1" style="width:90px" class="edit-door-count"
+                      data-id="${t.id}" data-name="${escapeHtml(t.name)}" value="${existing ? existing.count : 0}" />
+                  </div>
+                `;
+                  })
+                  .join("")}
+                <label class="checkbox-label"><input type="checkbox" class="edit-completed" ${r.work_completed ? "checked" : ""} /> Work completed</label>
+                <label>Notes<textarea class="edit-notes" rows="2">${escapeHtml(r.notes || "")}</textarea></label>
+                <div class="error" id="edit-report-${i}-error"></div>
+                <button type="submit" class="pill-btn pill-btn-sm">Save Changes</button>
+              </form>
+            </div>
+          `
+              : ""
+          }
         </div>
       `
               )
@@ -460,10 +498,55 @@ async function renderReports(content, user) {
       }
     </div>
   `;
-  content.querySelectorAll("[data-idx]").forEach((btn) => {
+  content.querySelectorAll('[data-action="photos"]').forEach((btn) => {
     btn.addEventListener("click", () => {
       const strip = content.querySelector(`#photos-${btn.dataset.idx}`);
       strip.style.display = strip.style.display === "none" ? "flex" : "none";
+    });
+  });
+  content.querySelectorAll('[data-action="edit"]').forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const panel = content.querySelector(`#edit-report-${btn.dataset.idx}`);
+      panel.style.display = panel.style.display === "none" ? "block" : "none";
+    });
+  });
+  content.querySelectorAll('[data-action="withdraw"]').forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const report = reports[Number(btn.dataset.idx)];
+      if (!confirm("Withdraw this report? This can't be undone — you'll need to submit a fresh one if you still need to report this work.")) return;
+      try {
+        await del(`/work-reports/${report.id}`);
+        renderReports(content, user, nav);
+      } catch (err) {
+        showMessage(content, err.message, "error");
+      }
+    });
+  });
+  content.querySelectorAll(".edit-report-form").forEach((form) => {
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const errorEl = form.querySelector(".error");
+      errorEl.textContent = "";
+      const doors = Array.from(form.querySelectorAll(".edit-door-count"))
+        .map((inp) => ({ door_type_id: inp.dataset.id, count: Number(inp.value) || 0 }))
+        .filter((d) => d.count > 0);
+      if (!doors.length) {
+        errorEl.textContent = "Enter a count for at least one door type";
+        return;
+      }
+      const btn = form.querySelector("button[type=submit]");
+      btn.disabled = true;
+      try {
+        await put(`/work-reports/${form.dataset.id}`, {
+          doors,
+          notes: form.querySelector(".edit-notes").value,
+          work_completed: form.querySelector(".edit-completed").checked,
+        });
+        renderReports(content, user, nav);
+      } catch (err) {
+        errorEl.textContent = err.message;
+        btn.disabled = false;
+      }
     });
   });
 }

@@ -7,6 +7,7 @@ work reports with photo evidence, admin approval workflow, payment ledger.
 import os
 import io
 import base64
+import math
 import secrets
 import uuid
 import logging
@@ -196,6 +197,15 @@ class WorkReportIn(BaseModel):
     client_sync_id: Optional[str] = None
 
 
+class WorkReportUpdateIn(BaseModel):
+    # Self-edit is scoped to counts/notes only, not photos — re-watermarking an
+    # already-watermarked photo would stack a second strip on it, so photo edits
+    # are deliberately out of scope here (withdraw and resubmit fresh instead).
+    doors: List[DoorLineItem] = Field(min_length=1)
+    notes: Optional[str] = ""
+    work_completed: bool = True
+
+
 class ApprovalIn(BaseModel):
     remarks: Optional[str] = ""
     edited_door_count: Optional[int] = None
@@ -300,15 +310,31 @@ async def get_effective_rate(worker_id: str, site_id: str) -> float:
     return 250.0
 
 
-async def get_installed_count(site_id: str, door_type_id: str) -> int:
+GEOFENCE_WARNING_METERS = 500  # generous buffer over typical phone GPS drift (10-50m)
+
+
+def haversine_meters(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    r = 6371000  # Earth radius, meters
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lng2 - lng1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+async def get_installed_count(site_id: str, door_type_id: str, exclude_report_id: Optional[str] = None) -> int:
     """Sum of this door type already recorded at this site across every report that
     isn't Rejected — Pending/Correction count too, so the ceiling can't be worked
-    around by racing multiple pending submissions ahead of admin review."""
+    around by racing multiple pending submissions ahead of admin review.
+    exclude_report_id lets an edit re-check the ceiling without double-counting
+    the very report being edited against itself."""
     total = 0
     async for r in db.work_reports.find(
         {"site_id": site_id, "approval_status": {"$ne": ApprovalStatus.rejected.value}},
-        {"_id": 0, "door_breakdown": 1},
+        {"_id": 0, "id": 1, "door_breakdown": 1},
     ):
+        if exclude_report_id and r.get("id") == exclude_report_id:
+            continue
         for item in r.get("door_breakdown", []):
             if item.get("door_type_id") == door_type_id:
                 total += item.get("count", 0)
@@ -706,6 +732,11 @@ async def check_in(body: CheckInIn, u=Depends(require_role(Role.worker, Role.adm
     site = await db.sites.find_one({"id": body.site_id}, {"_id": 0})
     if not site or site.get("status") != "Active":
         raise HTTPException(400, "Site is not active")
+    geo_distance_m = None
+    geo_warning = False
+    if site.get("latitude") is not None and site.get("longitude") is not None:
+        geo_distance_m = round(haversine_meters(body.latitude, body.longitude, site["latitude"], site["longitude"]))
+        geo_warning = geo_distance_m > GEOFENCE_WARNING_METERS
     session_id = str(uuid.uuid4())
     doc = {
         "id": session_id,
@@ -717,9 +748,13 @@ async def check_in(body: CheckInIn, u=Depends(require_role(Role.worker, Role.adm
         "check_in_latitude": body.latitude,
         "check_in_longitude": body.longitude,
         "check_in_accuracy": body.accuracy,
+        "check_in_geo_warning": geo_warning,
+        "check_in_geo_distance_m": geo_distance_m,
         "check_out_time": None,
         "check_out_latitude": None,
         "check_out_longitude": None,
+        "check_out_geo_warning": False,
+        "check_out_geo_distance_m": None,
         "work_completed": None,
         "remarks": "",
         "created_at": now_utc().isoformat(),
@@ -727,9 +762,12 @@ async def check_in(body: CheckInIn, u=Depends(require_role(Role.worker, Role.adm
     if body.client_sync_id:
         doc["client_sync_id"] = body.client_sync_id
     await db.attendance_sessions.insert_one(doc.copy())
-    # notify admins
+    # notify admins — never blocks the check-in itself, just flags it for a human look
+    msg = f"{u.get('name')} checked in at {site['site_name']}."
+    if geo_warning:
+        msg += f" ⚠️ {geo_distance_m}m from the site's recorded location — please verify."
     async for admin in db.users.find({"role": Role.admin.value}, {"_id": 0, "id": 1}):
-        await add_notification(admin["id"], "Worker Check-In", f"{u.get('name')} checked in at {site['site_name']}.")
+        await add_notification(admin["id"], "Worker Check-In", msg)
     return clean(doc)
 
 
@@ -742,17 +780,59 @@ async def check_out(body: CheckOutIn, u=Depends(require_role(Role.worker, Role.a
         raise HTTPException(403, "Not your session")
     if sess.get("check_out_time"):
         raise HTTPException(400, "Already checked out")
+    site = await db.sites.find_one({"id": sess["site_id"]}, {"_id": 0})
+    geo_distance_m = None
+    geo_warning = False
+    if site and site.get("latitude") is not None and site.get("longitude") is not None:
+        geo_distance_m = round(haversine_meters(body.latitude, body.longitude, site["latitude"], site["longitude"]))
+        geo_warning = geo_distance_m > GEOFENCE_WARNING_METERS
     upd = {
         "check_out_time": now_utc().isoformat(),
         "check_out_latitude": body.latitude,
         "check_out_longitude": body.longitude,
         "check_out_accuracy": body.accuracy,
+        "check_out_geo_warning": geo_warning,
+        "check_out_geo_distance_m": geo_distance_m,
         "work_completed": body.work_completed,
         "remarks": body.remarks or "",
     }
     await db.attendance_sessions.update_one({"id": body.session_id}, {"$set": upd})
+    msg = f"{u.get('name')} checked out from {sess['site_name']}."
+    if geo_warning:
+        msg += f" ⚠️ {geo_distance_m}m from the site's recorded location — please verify."
     async for admin in db.users.find({"role": Role.admin.value}, {"_id": 0, "id": 1}):
-        await add_notification(admin["id"], "Worker Check-Out", f"{u.get('name')} checked out from {sess['site_name']}.")
+        await add_notification(admin["id"], "Worker Check-Out", msg)
+    return {**sess, **upd}
+
+
+class ForceCheckoutIn(BaseModel):
+    remarks: Optional[str] = ""
+
+
+@api.post("/attendance/{session_id}/force-checkout")
+async def force_checkout(session_id: str, body: ForceCheckoutIn, u=Depends(require_role(Role.admin))):
+    """Admin-initiated close for a session the worker forgot to check out of —
+    no GPS captured since the admin wasn't physically there."""
+    sess = await db.attendance_sessions.find_one({"id": session_id}, {"_id": 0})
+    if not sess:
+        raise HTTPException(404, "Session not found")
+    if sess.get("check_out_time"):
+        raise HTTPException(400, "Already checked out")
+    upd = {
+        "check_out_time": now_utc().isoformat(),
+        "work_completed": None,  # unobserved — admin wasn't there to confirm
+        "remarks": body.remarks or "Closed by admin — worker did not check out.",
+        "force_closed_by": u["id"],
+        "force_closed_by_name": u.get("name") or u.get("username"),
+    }
+    await db.attendance_sessions.update_one({"id": session_id}, {"$set": upd})
+    await audit(u, "force-checkout", "attendance", session_id, sess, upd)
+    wu = await db.users.find_one({"worker_id": sess["worker_id"]}, {"_id": 0, "id": 1})
+    if wu:
+        await add_notification(
+            wu["id"], "Checked Out By Admin",
+            f"Your session at {sess.get('site_name')} was closed by an admin — you didn't check out.",
+        )
     return {**sess, **upd}
 
 
@@ -882,6 +962,84 @@ async def create_report(body: WorkReportIn, u=Depends(require_role(Role.worker, 
     return clean(doc)
 
 
+@api.put("/work-reports/{report_id}")
+async def update_report(report_id: str, body: WorkReportUpdateIn, u=Depends(require_role(Role.worker))):
+    """Worker self-edit of their own still-open report — fixes the 'wait for an
+    admin to notice a typo' gap. Only while Pending or Correction; editing a
+    Correction resets it to Pending since it needs a fresh look either way."""
+    r = await db.work_reports.find_one({"id": report_id}, {"_id": 0})
+    if not r:
+        raise HTTPException(404, "Not found")
+    if r["worker_id"] != u.get("worker_id"):
+        raise HTTPException(403, "Not your report")
+    if r["approval_status"] not in (ApprovalStatus.pending.value, ApprovalStatus.correction.value):
+        raise HTTPException(400, "Only a Pending or Correction report can be edited")
+    site_id = r["site_id"]
+    site = await db.sites.find_one({"id": site_id}, {"_id": 0})
+    targets = (site or {}).get("target_doors", {}) or {}
+    for item in body.doors:
+        target = targets.get(item.door_type_id)
+        if target is None:
+            continue
+        installed = await get_installed_count(site_id, item.door_type_id, exclude_report_id=report_id)
+        remaining = target - installed
+        if item.count > remaining:
+            door_type = await db.door_types.find_one({"id": item.door_type_id}, {"_id": 0})
+            type_name = door_type["name"] if door_type else "this door type"
+            raise HTTPException(
+                400,
+                f"Only {max(remaining, 0)} {type_name} remaining at this site "
+                f"(target: {target}, already recorded: {installed}).",
+            )
+    door_breakdown = []
+    door_count = 0
+    total = 0.0
+    for item in body.doors:
+        name, rate = await get_door_type_rate(item.door_type_id, site_id)
+        subtotal = round(item.count * rate, 2)
+        door_breakdown.append({
+            "door_type_id": item.door_type_id,
+            "door_type_name": name,
+            "rate": rate,
+            "count": item.count,
+            "subtotal": subtotal,
+        })
+        door_count += item.count
+        total += subtotal
+    total = round(total, 2)
+    upd = {
+        "door_count": door_count,
+        "rate_per_door": round(total / door_count, 2) if door_count else 0,
+        "door_breakdown": door_breakdown,
+        "total_amount": total,
+        "notes": body.notes or "",
+        "work_completed": body.work_completed,
+        "approval_status": ApprovalStatus.pending.value,
+    }
+    await db.work_reports.update_one({"id": report_id}, {"$set": upd})
+    await audit(u, "update", "work_report", report_id, r, upd)
+    async for admin in db.users.find({"role": Role.admin.value}, {"_id": 0, "id": 1}):
+        await add_notification(admin["id"], "Work Report Updated", f"{r.get('worker_name')} updated a report ({door_count} doors).")
+    return {**r, **upd}
+
+
+@api.delete("/work-reports/{report_id}")
+async def withdraw_report(report_id: str, u=Depends(require_role(Role.worker))):
+    """Worker withdraws their own report entirely, e.g. to redo it with different
+    photos — self-edit above deliberately can't touch photos, this is the escape
+    hatch for when photos are the thing that's wrong."""
+    r = await db.work_reports.find_one({"id": report_id}, {"_id": 0})
+    if not r:
+        raise HTTPException(404, "Not found")
+    if r["worker_id"] != u.get("worker_id"):
+        raise HTTPException(403, "Not your report")
+    if r["approval_status"] not in (ApprovalStatus.pending.value, ApprovalStatus.correction.value):
+        raise HTTPException(400, "Only a Pending or Correction report can be withdrawn")
+    await db.work_reports.delete_one({"id": report_id})
+    await audit(u, "delete", "work_report", report_id, r, None)
+    return {"ok": True}
+
+
 @api.get("/work-reports")
 async def list_reports(
     u=Depends(get_user),
@@ -962,6 +1120,43 @@ async def reject_report(report_id: str, body: ApprovalIn, u=Depends(require_role
 @api.post("/work-reports/{report_id}/correction")
 async def correction_report(report_id: str, body: ApprovalIn, u=Depends(require_role(Role.admin))):
     return await _approval_action(report_id, ApprovalStatus.correction.value, body, u)
+
+
+@api.post("/work-reports/{report_id}/unapprove")
+async def unapprove_report(report_id: str, body: ApprovalIn, u=Depends(require_role(Role.admin))):
+    """Reopen a mistakenly-approved report back to Pending. Restores door_count/
+    total_amount to what was actually submitted (from door_breakdown), undoing any
+    edit the admin made at approval time — reopening should mean starting review
+    over, not keeping half of a correction. Does not touch any payment already
+    recorded against it; that reconciliation is a separate manual step."""
+    r = await db.work_reports.find_one({"id": report_id}, {"_id": 0})
+    if not r:
+        raise HTTPException(404, "Not found")
+    if r.get("approval_status") != ApprovalStatus.approved.value:
+        raise HTTPException(400, "Only an Approved report can be reopened")
+    breakdown = r.get("door_breakdown") or []
+    upd = {
+        "approval_status": ApprovalStatus.pending.value,
+        "approval_remarks": body.remarks or "Reopened by admin for re-review",
+        "approved_by": None,
+        "approved_by_name": None,
+        "approved_at": None,
+    }
+    if breakdown:
+        orig_count = sum(item.get("count", 0) for item in breakdown)
+        orig_total = round(sum(item.get("subtotal", 0) for item in breakdown), 2)
+        upd["door_count"] = orig_count
+        upd["total_amount"] = orig_total
+        upd["rate_per_door"] = round(orig_total / orig_count, 2) if orig_count else 0
+    await db.work_reports.update_one({"id": report_id}, {"$set": upd})
+    await audit(u, "report-reopened", "work_report", report_id, r, upd)
+    wu = await db.users.find_one({"worker_id": r["worker_id"]}, {"_id": 0, "id": 1})
+    if wu:
+        await add_notification(
+            wu["id"], "Report Reopened",
+            f"Your approved report was reopened for review. {body.remarks or ''}",
+        )
+    return {**r, **upd}
 
 
 # --- Payments ------------------------------------------------------------
@@ -2210,6 +2405,19 @@ async def startup():
             unique=True,
             partialFilterExpression={"client_sync_id": {"$type": "string"}},
         )
+
+    # Compound indexes on the fields actually filtered/aggregated on constantly —
+    # invisible at today's data volume, a full collection scan on every dashboard
+    # load and report once history grows into the thousands of documents.
+    await db.work_reports.create_index([("worker_id", 1), ("work_date", -1)])
+    await db.work_reports.create_index([("site_id", 1), ("work_date", -1)])
+    await db.work_reports.create_index("approval_status")
+    await db.attendance_sessions.create_index([("worker_id", 1), ("check_in_time", -1)])
+    await db.attendance_sessions.create_index([("site_id", 1), ("check_in_time", -1)])
+    await db.attendance_sessions.create_index("check_out_time")
+    await db.payments.create_index([("worker_id", 1), ("payment_date", -1)])
+    await db.notifications.create_index([("user_id", 1), ("created_at", -1)])
+    await db.leaves.create_index([("worker_id", 1), ("status", 1)])
 
     # settings
     if not await db.settings.find_one({"id": "global"}):

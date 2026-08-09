@@ -139,6 +139,8 @@ function statusBadge(status) {
     Correction: "badge-info",
     Active: "badge-success",
     Disabled: "badge-danger",
+    Paid: "badge-success",
+    Unpaid: "badge-warning",
   }[status] || "badge-neutral";
   return `<span class="badge ${cls}">${escapeHtml(status)}</span>`;
 }

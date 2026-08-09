@@ -1896,6 +1896,26 @@ async def update_invoice(iid: str, body: InvoiceIn, u=Depends(require_role(Role.
     return {**old, **upd}
 
 
+@api.post("/invoices/{iid}/mark-paid")
+async def mark_invoice_paid(iid: str, u=Depends(require_role(Role.admin))):
+    old = await db.invoices.find_one({"id": iid}, {"_id": 0})
+    if not old:
+        raise HTTPException(404, "Not found")
+    await db.invoices.update_one({"id": iid}, {"$set": {"status": "Paid"}})
+    await audit(u, "update", "invoice", iid, old, {"status": "Paid"})
+    return {**old, "status": "Paid"}
+
+
+@api.post("/invoices/{iid}/mark-unpaid")
+async def mark_invoice_unpaid(iid: str, u=Depends(require_role(Role.admin))):
+    old = await db.invoices.find_one({"id": iid}, {"_id": 0})
+    if not old:
+        raise HTTPException(404, "Not found")
+    await db.invoices.update_one({"id": iid}, {"$set": {"status": "Unpaid"}})
+    await audit(u, "update", "invoice", iid, old, {"status": "Unpaid"})
+    return {**old, "status": "Unpaid"}
+
+
 @api.delete("/invoices/{iid}")
 async def delete_invoice(iid: str, u=Depends(require_role(Role.admin))):
     old = await db.invoices.find_one({"id": iid}, {"_id": 0})

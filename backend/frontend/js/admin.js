@@ -1020,19 +1020,25 @@ function collectInvoiceItems(itemsWrap) {
   }));
 }
 
-function invoiceFormHtml(idPrefix, inv) {
+function invoiceFormHtml(idPrefix, inv, sites) {
   return `
+    <label>Site (optional — needed for a client to see this invoice)
+      <select name="site_id">
+        <option value="">No site</option>
+        ${sites.map((s) => `<option value="${s.id}" ${inv?.site_id === s.id ? "selected" : ""}>${escapeHtml(s.site_name)}</option>`).join("")}
+      </select>
+    </label>
     <label>Client Name<input name="client_name" value="${escapeHtml(inv?.client_name || "")}" required /></label>
     <label>Client GSTIN<input name="client_gstin" value="${escapeHtml(inv?.client_gstin || "")}" /></label>
     <label>Client Address<input name="client_address" value="${escapeHtml(inv?.client_address || "")}" /></label>
-    <label>GST Rate %<input name="gst_rate" type="number" step="0.1" value="${inv?.gst_rate ?? 18}" /></label>
+    <label>GST Rate %<input name="gst_rate" type="number" step="0.1" min="0" max="100" value="${inv?.gst_rate ?? 18}" /></label>
     <div id="${idPrefix}-items"></div>
     <button type="button" class="btn-link" id="${idPrefix}-add-item">+ Add line item</button>
   `;
 }
 
 async function renderInvoices(content, nav) {
-  const invoices = await get("/invoices");
+  const [invoices, sites] = await Promise.all([get("/invoices"), get("/sites")]);
   content.innerHTML = `
     <div class="back-row">
       <button class="icon-btn" id="back-btn">←</button>
@@ -1041,7 +1047,7 @@ async function renderInvoices(content, nav) {
     </div>
     <div id="invoice-form-wrap" style="display:none" class="card-block">
       <form id="invoice-form">
-        ${invoiceFormHtml("new", null)}
+        ${invoiceFormHtml("new", null, sites)}
         <div class="error" id="invoice-error"></div>
         <button type="submit" class="pill-btn" style="margin-top:0.75rem">Create Invoice</button>
       </form>
@@ -1057,17 +1063,21 @@ async function renderInvoices(content, nav) {
               <div class="list-card-title">${escapeHtml(inv.invoice_number)}</div>
               <div class="list-card-sub">${escapeHtml(inv.client_name)} · ${escapeHtml(inv.invoice_date)}</div>
             </div>
-            <div class="list-card-amount">${money(inv.total)}</div>
+            <div style="display:flex;flex-direction:column;align-items:flex-end;gap:0.3rem">
+              <div class="list-card-amount">${money(inv.total)}</div>
+              ${statusBadge(inv.status)}
+            </div>
           </div>
-          <div class="actions" style="display:flex;gap:0.5rem;margin-top:0.5rem">
+          <div class="actions" style="display:flex;gap:0.5rem;margin-top:0.5rem;flex-wrap:wrap">
             <button class="pill-btn outline pill-btn-sm" data-idx="${i}" data-action="pdf">Download PDF</button>
             <button class="pill-btn outline pill-btn-sm" data-idx="${i}" data-action="edit">Edit</button>
+            <button class="pill-btn outline pill-btn-sm" data-idx="${i}" data-action="toggle-paid">${inv.status === "Paid" ? "Mark Unpaid" : "Mark Paid"}</button>
             <button class="pill-btn outline pill-btn-sm text-danger" data-idx="${i}" data-action="delete">Delete</button>
           </div>
         </div>
         <div class="card-block" id="inv-detail-${i}" style="display:none">
           <form class="invoice-edit-form" data-id="${inv.id}" data-idx="${i}">
-            ${invoiceFormHtml(`edit-inv-${i}`, inv)}
+            ${invoiceFormHtml(`edit-inv-${i}`, inv, sites)}
             <div class="error" id="edit-inv-${i}-error"></div>
             <button type="submit" class="pill-btn pill-btn-sm" style="margin-top:0.75rem">Save Changes</button>
           </form>
@@ -1099,6 +1109,7 @@ async function renderInvoices(content, nav) {
     btn.disabled = true;
     try {
       await post("/invoices", {
+        site_id: fd.get("site_id") || null,
         client_name: fd.get("client_name"),
         client_gstin: fd.get("client_gstin"),
         client_address: fd.get("client_address"),
@@ -1147,6 +1158,20 @@ async function renderInvoices(content, nav) {
       }
     });
   });
+  content.querySelectorAll('[data-action="toggle-paid"]').forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const inv = invoices[Number(btn.dataset.idx)];
+      const endpoint = inv.status === "Paid" ? "mark-unpaid" : "mark-paid";
+      btn.disabled = true;
+      try {
+        await post(`/invoices/${inv.id}/${endpoint}`, {});
+        renderInvoices(content, nav);
+      } catch (err) {
+        showMessage(content, err.message, "error");
+        btn.disabled = false;
+      }
+    });
+  });
   content.querySelectorAll(".invoice-edit-form").forEach((form) => {
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
@@ -1158,6 +1183,7 @@ async function renderInvoices(content, nav) {
       btn.disabled = true;
       try {
         await put(`/invoices/${form.dataset.id}`, {
+          site_id: fd.get("site_id") || null,
           client_name: fd.get("client_name"),
           client_gstin: fd.get("client_gstin"),
           client_address: fd.get("client_address"),

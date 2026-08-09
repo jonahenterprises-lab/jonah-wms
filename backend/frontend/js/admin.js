@@ -882,11 +882,14 @@ async function renderPayout(content, nav) {
     btn.disabled = true;
     btn.textContent = "Recording…";
     try {
-      await post("/payments/batch", {
+      const result = await post("/payments/batch", {
         payments: selected.map((r) => ({ worker_id: r.worker_id, amount: r.pending_amount, payment_method: r.preferred_method, notes: "Batch payout" })),
         client_sync_id: batchSyncId,
       });
-      renderPayout(content, nav);
+      await renderPayout(content, nav);
+      if (result.warnings && result.warnings.length) {
+        showMessage(content, `Possible duplicate payment(s) — please double-check:\n${result.warnings.join("\n")}`, "warning");
+      }
     } catch (err) {
       showMessage(content, err.message, "error");
       btn.disabled = false;

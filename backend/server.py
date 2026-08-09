@@ -1223,6 +1223,20 @@ async def unapprove_report(report_id: str, body: ApprovalIn, u=Depends(require_r
 
 
 # --- Payments ------------------------------------------------------------
+DUPLICATE_PAYMENT_WINDOW_MINUTES = 30  # catches stale-data re-runs, distinct from client_sync_id's exact-retry case
+
+
+async def find_recent_duplicate_payment(worker_id: str, amount: float) -> Optional[dict]:
+    """A same-worker, same-amount payment recorded moments ago is almost always
+    a duplicate (stale pending-amount data, a re-run of the payout screen) —
+    never blocked, just flagged so the admin can double-check."""
+    cutoff = (now_utc() - timedelta(minutes=DUPLICATE_PAYMENT_WINDOW_MINUTES)).isoformat()
+    return await db.payments.find_one(
+        {"worker_id": worker_id, "amount": round(amount, 2), "created_at": {"$gt": cutoff}},
+        {"_id": 0},
+    )
+
+
 @api.post("/payments")
 async def create_payment(body: PaymentIn, u=Depends(require_role(Role.admin))):
     if body.amount <= 0:
@@ -1235,6 +1249,7 @@ async def create_payment(body: PaymentIn, u=Depends(require_role(Role.admin))):
     worker = await db.workers.find_one({"id": body.worker_id}, {"_id": 0})
     if not worker:
         raise HTTPException(404, "Worker not found")
+    duplicate = await find_recent_duplicate_payment(body.worker_id, body.amount)
     doc = {
         "id": str(uuid.uuid4()),
         "worker_id": body.worker_id,
@@ -1255,7 +1270,13 @@ async def create_payment(body: PaymentIn, u=Depends(require_role(Role.admin))):
     worker_user = await db.users.find_one({"worker_id": body.worker_id}, {"_id": 0, "id": 1})
     if worker_user:
         await add_notification(worker_user["id"], "Payment Added", f"Payment of ₹{doc['amount']} recorded.")
-    return clean(doc)
+    result = clean(doc)
+    if duplicate:
+        result["duplicate_warning"] = (
+            f"Another ₹{duplicate['amount']} payment to {worker['name']} was recorded "
+            f"at {formatted_ist(duplicate['created_at'])}. Please double-check this isn't a repeat."
+        )
+    return result
 
 
 @api.get("/payments")
@@ -1550,10 +1571,12 @@ async def batch_payments(body: BatchPayIn, u=Depends(require_role(Role.admin))):
             return {"created": len(existing), "payments": existing}
     date = body.payment_date or now_utc().date().isoformat()
     created = []
+    warnings = []
     for item in body.payments:
         worker = await db.workers.find_one({"id": item.worker_id}, {"_id": 0})
         if not worker:
             continue  # skip unknown, don't fail whole batch
+        duplicate = await find_recent_duplicate_payment(item.worker_id, item.amount)
         doc = {
             "id": str(uuid.uuid4()),
             "worker_id": item.worker_id,
@@ -1574,7 +1597,11 @@ async def batch_payments(body: BatchPayIn, u=Depends(require_role(Role.admin))):
         if wu:
             await add_notification(wu["id"], "Payment Added", f"Payment of ₹{doc['amount']} recorded.")
         created.append(clean(doc))
-    return {"created": len(created), "payments": created}
+        if duplicate:
+            warnings.append(
+                f"{worker['name']}: another ₹{doc['amount']} payment was recorded at {formatted_ist(duplicate['created_at'])}."
+            )
+    return {"created": len(created), "payments": created, "warnings": warnings}
 
 
 # --- Audit log -----------------------------------------------------------

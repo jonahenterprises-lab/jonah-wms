@@ -667,6 +667,11 @@ label {
   background: var(--info-bg);
   color: var(--info);
 }
+.msg-warning {
+  background: var(--warning-bg);
+  color: var(--warning);
+  white-space: pre-line;
+}
 
 .error {
   color: var(--danger);

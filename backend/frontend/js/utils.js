@@ -123,7 +123,7 @@ function showMessage(container, text, type = "info") {
   el.textContent = text;
   el.className = `msg-banner msg-${type}`;
   el.style.display = "block";
-  if (type !== "error") {
+  if (type !== "error" && type !== "warning") {
     clearTimeout(el._timer);
     el._timer = setTimeout(() => {
       el.style.display = "none";

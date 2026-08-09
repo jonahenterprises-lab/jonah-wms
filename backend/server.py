@@ -2020,6 +2020,8 @@ async def salary_slip(worker_id: str, month: Optional[str] = None, token: Option
     if payload.get("role") == Role.worker.value and payload.get("worker_id") != worker_id:
         raise HTTPException(403, "Forbidden")
     month = month or now_utc().strftime("%Y-%m")
+    if not re.match(r"^\d{4}-(0[1-9]|1[0-2])$", month):
+        raise HTTPException(400, "month must be in YYYY-MM format")
     worker = await db.workers.find_one({"id": worker_id}, {"_id": 0})
     if not worker: raise HTTPException(404, "Worker not found")
 
@@ -2066,12 +2068,16 @@ async def salary_slip(worker_id: str, month: Optional[str] = None, token: Option
         Paragraph(f"Mobile: {worker.get('mobile', '-')}", styles["Normal"]),
         Spacer(1, 10),
     ]
+    # Actual blended rate for the month, not the worker's flat default_rate — door
+    # types and per-site overrides mean those can genuinely differ, and showing the
+    # wrong one here would visibly disagree with the gross figure right below it.
+    effective_rate = (total / doors) if doors else worker.get("default_rate", 0)
     tbl = Table([
         ["Metric", "Value"],
         ["Working Days", len(days)],
         ["Site Sessions", sessions],
         ["Doors Installed", doors],
-        ["Rate Per Door", f"₹ {worker.get('default_rate', 0):.2f}"],
+        ["Rate Per Door", f"₹ {effective_rate:.2f}"],
         ["Gross Approved Earnings", f"₹ {total:.2f}"],
         ["Amount Paid This Month", f"₹ {paid:.2f}"],
         ["Net Balance Carried", f"₹ {total - paid:.2f}"],

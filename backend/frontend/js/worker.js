@@ -524,11 +524,13 @@ async function renderReports(content, user, nav) {
     btn.addEventListener("click", async () => {
       const report = reports[Number(btn.dataset.idx)];
       if (!confirm("Withdraw this report? This can't be undone — you'll need to submit a fresh one if you still need to report this work.")) return;
+      btn.disabled = true;
       try {
         await del(`/work-reports/${report.id}`);
         renderReports(content, user, nav);
       } catch (err) {
         showMessage(content, err.message, "error");
+        btn.disabled = false;
       }
     });
   });
@@ -788,6 +790,8 @@ async function renderLeave(content, user, nav) {
     e.preventDefault();
     const errorEl = content.querySelector("#leave-error");
     errorEl.textContent = "";
+    const btn = e.target.querySelector('button[type="submit"]');
+    btn.disabled = true;
     try {
       await post("/leaves", {
         start_date: content.querySelector("#leave-start").value,
@@ -798,6 +802,7 @@ async function renderLeave(content, user, nav) {
       renderLeave(content, user, nav);
     } catch (err) {
       errorEl.textContent = err.message;
+      btn.disabled = false;
     }
   });
 }

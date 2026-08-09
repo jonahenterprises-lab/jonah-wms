@@ -43,6 +43,7 @@ const TABS = [
 
 const MORE_TILES = [
   { key: "payout", icon: "💰", label: "Weekly Payout" },
+  { key: "payments", icon: "💵", label: "Payments" },
   { key: "invoices", icon: "🧾", label: "GST Invoices" },
   { key: "leaves", icon: "📅", label: "Leaves" },
   { key: "attendance", icon: "🗺️", label: "Attendance & Map" },
@@ -97,6 +98,7 @@ export function renderAdmin(frame, user, logout) {
     sites: renderSites,
     more: renderMore,
     payout: renderPayout,
+    payments: renderPayments,
     invoices: renderInvoices,
     leaves: renderLeaves,
     attendance: renderAttendance,
@@ -323,11 +325,13 @@ async function renderApprovals(content) {
         btn.addEventListener("click", async () => {
           const report = reports[Number(btn.dataset.idx)];
           const remarks = prompt(`Remarks for ${promptLabel[action]} (optional):`, "") || "";
+          btn.disabled = true;
           try {
             await post(`/work-reports/${report.id}/${map[action]}`, { remarks });
             load(status);
           } catch (err) {
             showMessage(content, err.message, "error");
+            btn.disabled = false;
           }
         });
       });
@@ -418,6 +422,8 @@ async function renderWorkers(content) {
       form.addEventListener("submit", async (e) => {
         e.preventDefault();
         const fd = new FormData(form);
+        const btn = form.querySelector('button[type="submit"]');
+        btn.disabled = true;
         try {
           await put(`/workers/${form.dataset.id}`, {
             name: fd.get("name"),
@@ -427,6 +433,7 @@ async function renderWorkers(content) {
           renderWorkers(content);
         } catch (err) {
           showMessage(content, err.message, "error");
+          btn.disabled = false;
         }
       });
     });
@@ -439,22 +446,27 @@ async function renderWorkers(content) {
           alert("Password must be at least 8 characters");
           return;
         }
+        btn.disabled = true;
         try {
           await post(`/workers/${id}/reset-password`, pwd ? { new_password: pwd } : {});
           showMessage(content, "Password reset", "success");
         } catch (err) {
           showMessage(content, err.message, "error");
+        } finally {
+          btn.disabled = false;
         }
       });
     });
     listEl.querySelectorAll('[data-action="toggle-status"]').forEach((btn) => {
       btn.addEventListener("click", async () => {
         const nextStatus = btn.dataset.status === "Active" ? "Disabled" : "Active";
+        btn.disabled = true;
         try {
           await put(`/workers/${btn.dataset.id}`, { status: nextStatus });
           renderWorkers(content);
         } catch (err) {
           showMessage(content, err.message, "error");
+          btn.disabled = false;
         }
       });
     });
@@ -484,6 +496,8 @@ async function renderWorkers(content) {
     const errorEl = content.querySelector("#add-error");
     errorEl.textContent = "";
     const fd = new FormData(e.target);
+    const btn = e.target.querySelector('button[type="submit"]');
+    btn.disabled = true;
     try {
       await post("/workers", {
         employee_id: fd.get("employee_id"),
@@ -496,6 +510,7 @@ async function renderWorkers(content) {
       renderWorkers(content);
     } catch (err) {
       errorEl.textContent = err.message;
+      btn.disabled = false;
     }
   });
 }
@@ -702,6 +717,8 @@ async function renderSites(content) {
     const errorEl = content.querySelector("#add-error");
     errorEl.textContent = "";
     const fd = new FormData(e.target);
+    const btn = e.target.querySelector('button[type="submit"]');
+    btn.disabled = true;
     try {
       await post("/sites", {
         site_name: fd.get("site_name"),
@@ -718,6 +735,7 @@ async function renderSites(content) {
       renderSites(content);
     } catch (err) {
       errorEl.textContent = err.message;
+      btn.disabled = false;
     }
   });
 
@@ -737,6 +755,8 @@ async function renderSites(content) {
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       const fd = new FormData(form);
+      const btn = form.querySelector('button[type="submit"]');
+      btn.disabled = true;
       try {
         await put(`/sites/${form.dataset.id}`, {
           site_name: fd.get("site_name"),
@@ -754,6 +774,7 @@ async function renderSites(content) {
         renderSites(content);
       } catch (err) {
         showMessage(content, err.message, "error");
+        btn.disabled = false;
       }
     });
   });
@@ -898,6 +919,53 @@ async function renderPayout(content, nav) {
   });
 }
 
+async function renderPayments(content, nav) {
+  const payments = await get("/payments");
+  content.innerHTML = `
+    <div class="back-row">
+      <button class="icon-btn" id="back-btn">←</button>
+      <h1 class="page-title">Payments</h1>
+    </div>
+    <input type="search" id="payment-search" placeholder="Search by worker, method, or reference…" style="margin-bottom:0.75rem" />
+    <div id="payment-list"></div>
+  `;
+  content.querySelector("#back-btn").addEventListener("click", () => nav.back("more"));
+
+  const listEl = content.querySelector("#payment-list");
+  const searchEl = content.querySelector("#payment-search");
+  function renderList(items) {
+    listEl.innerHTML =
+      items
+        .map(
+          (p) => `
+      <div class="list-card">
+        <div class="list-card-body">
+          <div class="list-card-title">${escapeHtml(p.worker_name)}</div>
+          <div class="list-card-sub">${escapeHtml(p.payment_method)}${p.transaction_reference ? " · " + escapeHtml(p.transaction_reference) : ""} · ${escapeHtml(p.payment_date)}</div>
+          ${p.notes ? `<div class="list-card-meta">${escapeHtml(p.notes)}</div>` : ""}
+        </div>
+        <div class="list-card-amount">${money(p.amount)}</div>
+      </div>
+    `
+        )
+        .join("") ||
+      `<div class="empty-state">${payments.length ? "No payments match your search" : "No payments yet"}</div>`;
+  }
+  searchEl.addEventListener("input", () => {
+    const q = searchEl.value.trim().toLowerCase();
+    const filtered = q
+      ? payments.filter(
+          (p) =>
+            p.worker_name.toLowerCase().includes(q) ||
+            p.payment_method.toLowerCase().includes(q) ||
+            (p.transaction_reference || "").toLowerCase().includes(q)
+        )
+      : payments;
+    renderList(filtered);
+  });
+  renderList(payments);
+}
+
 function addInvoiceItemRow(itemsWrap, item) {
   const row = document.createElement("div");
   row.className = "card-block item-row";
@@ -1000,6 +1068,8 @@ async function renderInvoices(content, nav) {
     const errorEl = content.querySelector("#invoice-error");
     errorEl.textContent = "";
     const fd = new FormData(e.target);
+    const btn = e.target.querySelector('button[type="submit"]');
+    btn.disabled = true;
     try {
       await post("/invoices", {
         client_name: fd.get("client_name"),
@@ -1011,6 +1081,7 @@ async function renderInvoices(content, nav) {
       renderInvoices(content, nav);
     } catch (err) {
       errorEl.textContent = err.message;
+      btn.disabled = false;
     }
   });
 
@@ -1039,11 +1110,13 @@ async function renderInvoices(content, nav) {
     btn.addEventListener("click", async () => {
       const inv = invoices[Number(btn.dataset.idx)];
       if (!confirm(`Delete invoice ${inv.invoice_number}? This cannot be undone.`)) return;
+      btn.disabled = true;
       try {
         await del(`/invoices/${inv.id}`);
         renderInvoices(content, nav);
       } catch (err) {
         showMessage(content, err.message, "error");
+        btn.disabled = false;
       }
     });
   });
@@ -1054,6 +1127,8 @@ async function renderInvoices(content, nav) {
       const errorEl = content.querySelector(`#edit-inv-${idx}-error`);
       errorEl.textContent = "";
       const fd = new FormData(form);
+      const btn = form.querySelector('button[type="submit"]');
+      btn.disabled = true;
       try {
         await put(`/invoices/${form.dataset.id}`, {
           client_name: fd.get("client_name"),
@@ -1065,6 +1140,7 @@ async function renderInvoices(content, nav) {
         renderInvoices(content, nav);
       } catch (err) {
         errorEl.textContent = err.message;
+        btn.disabled = false;
       }
     });
   });
@@ -1119,11 +1195,13 @@ async function renderLeaves(content, nav) {
       listEl.querySelectorAll(`[data-action="${action}"]`).forEach((btn) => {
         btn.addEventListener("click", async () => {
           const remarks = prompt(`Remarks for ${action} (optional):`, "") || "";
+          btn.disabled = true;
           try {
             await post(`/leaves/${leaves[Number(btn.dataset.idx)].id}/${map[action]}`, { remarks });
             load(status);
           } catch (err) {
             showMessage(content, err.message, "error");
+            btn.disabled = false;
           }
         });
       });
@@ -1246,6 +1324,7 @@ const REPORT_TYPES = [
 ];
 
 async function renderReportsExport(content, nav) {
+  const sites = await get("/sites");
   content.innerHTML = `
     <div class="back-row">
       <button class="icon-btn" id="back-btn">←</button>
@@ -1254,6 +1333,12 @@ async function renderReportsExport(content, nav) {
     <div class="card-block">
       <label>From<input type="date" id="date-from" /></label>
       <label>To<input type="date" id="date-to" /></label>
+      <label>Site / Team (attendance &amp; installs reports only)
+        <select id="site-filter">
+          <option value="">All sites</option>
+          ${sites.map((s) => `<option value="${s.id}">${escapeHtml(s.site_name)}</option>`).join("")}
+        </select>
+      </label>
     </div>
     ${REPORT_TYPES.map(
       (r) => `
@@ -1272,9 +1357,11 @@ async function renderReportsExport(content, nav) {
     btn.addEventListener("click", () => {
       const dateFrom = content.querySelector("#date-from").value;
       const dateTo = content.querySelector("#date-to").value;
+      const siteId = content.querySelector("#site-filter").value;
       const params = new URLSearchParams({ report: btn.dataset.report, fmt: btn.dataset.fmt });
       if (dateFrom) params.set("date_from", dateFrom);
       if (dateTo) params.set("date_to", dateTo);
+      if (siteId) params.set("site_id", siteId);
       downloadWithToken(`/reports/export?${params.toString()}`);
     });
   });
@@ -1390,6 +1477,8 @@ async function renderSettings(content, nav) {
     const errorEl = content.querySelector("#settings-error");
     errorEl.textContent = "";
     const fd = new FormData(e.target);
+    const btn = e.target.querySelector('button[type="submit"]');
+    btn.disabled = true;
     try {
       await put("/settings", {
         company_name: fd.get("company_name"),
@@ -1406,6 +1495,8 @@ async function renderSettings(content, nav) {
       showMessage(content, "Settings saved", "success");
     } catch (err) {
       errorEl.textContent = err.message;
+    } finally {
+      btn.disabled = false;
     }
   });
 }
@@ -1512,11 +1603,14 @@ async function renderDoorTypes(content, nav) {
     const errorEl = content.querySelector("#add-error");
     errorEl.textContent = "";
     const fd = new FormData(e.target);
+    const btn = e.target.querySelector('button[type="submit"]');
+    btn.disabled = true;
     try {
       await post("/door-types", { name: fd.get("name"), default_rate: Number(fd.get("default_rate")) });
       renderDoorTypes(content, nav);
     } catch (err) {
       errorEl.textContent = err.message;
+      btn.disabled = false;
     }
   });
   content.querySelectorAll("[data-idx]").forEach((btn) => {
@@ -1529,6 +1623,8 @@ async function renderDoorTypes(content, nav) {
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       const fd = new FormData(form);
+      const btn = form.querySelector('button[type="submit"]');
+      btn.disabled = true;
       try {
         await put(`/door-types/${form.dataset.id}`, {
           name: fd.get("name"),
@@ -1538,6 +1634,7 @@ async function renderDoorTypes(content, nav) {
         renderDoorTypes(content, nav);
       } catch (err) {
         showMessage(content, err.message, "error");
+        btn.disabled = false;
       }
     });
   });

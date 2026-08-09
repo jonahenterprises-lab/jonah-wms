@@ -2,6 +2,7 @@ import { getToken, api, clearToken, setUser } from "./api.js";
 import { renderLogin } from "./auth.js";
 import { renderAdmin } from "./admin.js";
 import { renderWorker } from "./worker.js";
+import { escapeHtml } from "./utils.js";
 
 const root = document.getElementById("app");
 
@@ -16,9 +17,29 @@ async function boot() {
     setUser(me);
     renderShell(me);
   } catch (e) {
-    clearToken();
-    renderLogin(root, renderShell);
+    // A 401 already cleared the token and reloaded inside api() — anything else
+    // (offline, timeout, server unreachable) is transient, so keep the session
+    // and offer a retry instead of silently logging the worker out.
+    if (e.message === "Not authenticated") return;
+    renderConnectionError(e.message);
   }
+}
+
+function renderConnectionError(message) {
+  root.innerHTML = `
+    <div class="shell">
+      <div class="app-frame">
+        <div class="content">
+          <div class="empty-state">
+            <div class="title">Can't connect</div>
+            ${escapeHtml(message)}
+          </div>
+          <button class="pill-btn" id="retry-btn" style="margin-top:1rem">Retry</button>
+        </div>
+      </div>
+    </div>
+  `;
+  root.querySelector("#retry-btn").addEventListener("click", boot);
 }
 
 function logout() {

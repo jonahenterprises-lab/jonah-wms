@@ -411,15 +411,19 @@ async function renderReportForm(content, user, nav, logout, params) {
       // time — running both batches concurrently is what let peak memory spike.
       const beforePhotos = await filesToDataUris(beforeInput.files);
       const afterPhotos = await filesToDataUris(afterInput.files);
-      await post("/work-reports", {
-        session_id: session.id,
-        doors,
-        work_completed: content.querySelector("#report-completed").checked,
-        notes: content.querySelector("#report-notes").value,
-        before_photos: beforePhotos,
-        after_photos: afterPhotos,
-        client_sync_id: uuid(),
-      });
+      await post(
+        "/work-reports",
+        {
+          session_id: session.id,
+          doors,
+          work_completed: content.querySelector("#report-completed").checked,
+          notes: content.querySelector("#report-notes").value,
+          before_photos: beforePhotos,
+          after_photos: afterPhotos,
+          client_sync_id: uuid(),
+        },
+        { timeoutMs: 120000 } // photo uploads over slow mobile data need more room than the 30s default
+      );
       nav.goTab("reports");
     } catch (err) {
       errorEl.textContent = err.message;

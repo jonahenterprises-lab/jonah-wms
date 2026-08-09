@@ -1,0 +1,8 @@
+backend/.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+backend/certs/
+backend/uvicorn.log
+.claude/

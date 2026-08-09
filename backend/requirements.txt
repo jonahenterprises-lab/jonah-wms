@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+motor
+pymongo
+python-dotenv
+pyjwt
+passlib[bcrypt]
+bcrypt<4.1  # passlib 1.7.4's bcrypt backend detection breaks on bcrypt>=4.1
+pydantic
+httpx
+Pillow
+reportlab
+openpyxl
+python-multipart

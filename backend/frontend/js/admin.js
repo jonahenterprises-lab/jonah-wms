@@ -1,0 +1,1040 @@
+import { get, post, put, del } from "./api.js";
+import { getPosition, money, escapeHtml, formatDateTime, showMessage, statusBadge } from "./utils.js";
+
+const DEFAULT_MAP_CENTER = [12.9716, 77.5946]; // Bengaluru fallback
+
+function initLocationPicker(container, latInput, lngInput, initialLat, initialLng) {
+  const hasInitial = typeof initialLat === "number" && typeof initialLng === "number";
+  const start = hasInitial ? [initialLat, initialLng] : DEFAULT_MAP_CENTER;
+  const map = L.map(container, { scrollWheelZoom: false }).setView(start, hasInitial ? 15 : 11);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    attribution: "© OpenStreetMap contributors",
+    maxZoom: 19,
+  }).addTo(map);
+  const marker = L.marker(start, { draggable: true }).addTo(map);
+
+  function applyLatLng(latlng, panTo) {
+    latInput.value = latlng.lat.toFixed(6);
+    lngInput.value = latlng.lng.toFixed(6);
+    marker.setLatLng(latlng);
+    if (panTo) map.setView(latlng, Math.max(map.getZoom(), 15));
+  }
+  if (hasInitial) applyLatLng({ lat: initialLat, lng: initialLng }, false);
+
+  marker.on("dragend", () => applyLatLng(marker.getLatLng(), false));
+  map.on("click", (e) => applyLatLng(e.latlng, false));
+  [latInput, lngInput].forEach((inp) =>
+    inp.addEventListener("change", () => {
+      const lat = parseFloat(latInput.value);
+      const lng = parseFloat(lngInput.value);
+      if (!isNaN(lat) && !isNaN(lng)) applyLatLng({ lat, lng }, true);
+    })
+  );
+  return { map, marker, applyLatLng };
+}
+
+const TABS = [
+  { key: "dashboard", icon: "📊", label: "Dashboard" },
+  { key: "approvals", icon: "✅", label: "Approvals" },
+  { key: "workers", icon: "👥", label: "Workers" },
+  { key: "sites", icon: "🏢", label: "Sites" },
+  { key: "more", icon: "⋯", label: "More" },
+];
+
+const MORE_TILES = [
+  { key: "payout", icon: "💰", label: "Weekly Payout" },
+  { key: "invoices", icon: "🧾", label: "GST Invoices" },
+  { key: "leaves", icon: "📅", label: "Leaves" },
+  { key: "attendance", icon: "🗺️", label: "Attendance & Map" },
+  { key: "reports", icon: "⬇️", label: "Reports & Export" },
+  { key: "audit", icon: "🛡️", label: "Audit Log" },
+  { key: "settings", icon: "⚙️", label: "Settings" },
+];
+
+async function downloadWithToken(path) {
+  const { token } = await post("/reports/download-token", {});
+  const sep = path.includes("?") ? "&" : "?";
+  window.open(`/api${path}${sep}token=${encodeURIComponent(token)}`, "_blank");
+}
+
+export function renderAdmin(frame, user, logout) {
+  frame.innerHTML = `
+    <div class="content" id="content"></div>
+    <nav class="bottom-nav" id="bottom-nav">
+      ${TABS.map((t) => `<button data-tab="${t.key}"><span class="nav-icon">${t.icon}</span>${t.label}</button>`).join("")}
+    </nav>
+  `;
+  const content = frame.querySelector("#content");
+  const navEl = frame.querySelector("#bottom-nav");
+  const state = { tab: "dashboard", view: "dashboard", params: {} };
+
+  const nav = {
+    goTab(tab) {
+      state.tab = tab;
+      state.view = tab;
+      state.params = {};
+      render();
+    },
+    pushView(view, params = {}) {
+      state.view = view;
+      state.params = params;
+      render();
+    },
+    back(tab) {
+      state.view = tab || state.tab;
+      state.params = {};
+      render();
+    },
+  };
+
+  const renderers = {
+    dashboard: renderDashboard,
+    approvals: renderApprovals,
+    workers: renderWorkers,
+    sites: renderSites,
+    more: renderMore,
+    payout: renderPayout,
+    invoices: renderInvoices,
+    leaves: renderLeaves,
+    attendance: renderAttendance,
+    reports: renderReportsExport,
+    audit: renderAudit,
+    settings: renderSettings,
+  };
+
+  function render() {
+    Array.from(navEl.children).forEach((btn) => btn.classList.toggle("active", btn.dataset.tab === state.tab));
+    content.innerHTML = '<div class="loading">Loading…</div>';
+    renderers[state.view](content, nav, logout, state.params, user).catch((err) => {
+      content.innerHTML = "";
+      showMessage(content, err.message, "error");
+    });
+  }
+
+  navEl.querySelectorAll("button").forEach((btn) => {
+    btn.addEventListener("click", () => nav.goTab(btn.dataset.tab));
+  });
+
+  render();
+}
+
+function barChart(rows, valueKey, labelKey) {
+  const max = Math.max(1, ...rows.map((r) => r[valueKey]));
+  return `
+    <div class="bar-chart">
+      ${rows
+        .map(
+          (r) => `
+        <div class="bar-col">
+          <div class="bar" style="height:${Math.max(2, (r[valueKey] / max) * 90)}px"></div>
+          <div class="bar-label">${escapeHtml(String(r[labelKey]).slice(-2))}</div>
+        </div>
+      `
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function progressList(rows, labelKey, valueKey, amountKey) {
+  const max = Math.max(1, ...rows.map((r) => r[valueKey]));
+  return rows
+    .map(
+      (r) => `
+    <div class="progress-row">
+      <div class="progress-row-top"><span>${escapeHtml(r[labelKey])}</span><span>${r[valueKey]}</span></div>
+      <div class="progress-track"><div class="progress-fill" style="width:${(r[valueKey] / max) * 100}%"></div></div>
+      <div class="list-card-meta">${money(r[amountKey])}</div>
+    </div>
+  `
+    )
+    .join("");
+}
+
+async function renderDashboard(content, nav) {
+  const [d, charts] = await Promise.all([get("/admin/dashboard"), get("/admin/charts").catch(() => null)]);
+  content.innerHTML = `
+    <div class="page-header-row">
+      <div>
+        <h1 class="page-title">Admin Dashboard</h1>
+        <p class="page-subtitle">JONAH ENTERPRISES</p>
+      </div>
+      <div class="avatar-circle">JE</div>
+    </div>
+
+    <div class="hero-block">
+      <div class="hero-label">Pending Approvals</div>
+      <div class="hero-value">${d.pending_reports}</div>
+      <div class="hero-sub">Reports awaiting your review</div>
+    </div>
+
+    <div class="section-label">Workers</div>
+    <div class="stat-grid">
+      <div class="stat-tile"><div class="stat-tile-label">Total</div><div class="stat-tile-value">${d.workers.total}</div></div>
+      <div class="stat-tile"><div class="stat-tile-label">Active Today</div><div class="stat-tile-value">${d.workers.active_today}</div></div>
+    </div>
+    <div class="stat-grid">
+      <div class="stat-tile"><div class="stat-tile-label">Checked In Now</div><div class="stat-tile-value">${d.workers.currently_checked_in}</div></div>
+      <div class="stat-tile"><div class="stat-tile-label">Inactive Today</div><div class="stat-tile-value">${d.workers.inactive_today}</div></div>
+    </div>
+
+    <div class="section-label">Sites</div>
+    <div class="stat-grid">
+      <div class="stat-tile"><div class="stat-tile-label">Active Sites</div><div class="stat-tile-value">${d.sites.total_active}</div></div>
+      <div class="stat-tile"><div class="stat-tile-label">Sites Today</div><div class="stat-tile-value">${d.sites.with_workers_today}</div></div>
+    </div>
+
+    <div class="section-label">Doors Installed</div>
+    <div class="stat-grid cols-3">
+      <div class="stat-tile"><div class="stat-tile-label">Today</div><div class="stat-tile-value">${d.doors.today}</div></div>
+      <div class="stat-tile"><div class="stat-tile-label">This Month</div><div class="stat-tile-value">${d.doors.month}</div></div>
+      <div class="stat-tile"><div class="stat-tile-label">This Year</div><div class="stat-tile-value">${d.doors.year}</div></div>
+    </div>
+
+    <div class="section-label">Financials</div>
+    <div class="hero-block">
+      <div class="hero-label">Total Approved</div>
+      <div class="hero-value">${money(d.financial.approved_total)}</div>
+    </div>
+    <div class="stat-grid">
+      <div class="stat-tile"><div class="stat-tile-label">Paid</div><div class="stat-tile-value">${money(d.financial.paid_total)}</div></div>
+      <div class="stat-tile"><div class="stat-tile-label">Pending</div><div class="stat-tile-value">${money(d.financial.pending_total)}</div></div>
+    </div>
+
+    ${
+      charts
+        ? `
+      <div class="section-label">Trends</div>
+      <div class="card-block">
+        <strong>Doors Installed (last 6 months)</strong>
+        ${barChart(charts.monthly_doors, "value", "month")}
+      </div>
+      <div class="card-block">
+        <strong>Payments Paid Out (₹)</strong>
+        ${barChart(charts.monthly_payments, "value", "month")}
+      </div>
+      <div class="card-block">
+        <strong>Top Workers by Doors</strong>
+        <div style="margin-top:0.6rem">${progressList(charts.top_workers, "worker_name", "doors", "amount") || "No data yet"}</div>
+      </div>
+      <div class="card-block">
+        <strong>Site-wise Installations</strong>
+        <div style="margin-top:0.6rem">${progressList(charts.site_installations, "site_name", "doors", "amount") || "No data yet"}</div>
+      </div>
+    `
+        : ""
+    }
+  `;
+}
+
+async function renderApprovals(content) {
+  const filters = ["Pending", "Approved", "Rejected", "Correction"];
+  content.innerHTML = `
+    <h1 class="page-title">Approval Queue</h1>
+    <div class="filter-pills" id="filter-pills">
+      ${filters.map((f, i) => `<button class="filter-pill ${i === 0 ? "active" : ""}" data-status="${f}">${f}</button>`).join("")}
+    </div>
+    <div id="report-list"></div>
+  `;
+  const listEl = content.querySelector("#report-list");
+  const pillsEl = content.querySelector("#filter-pills");
+
+  async function load(status) {
+    listEl.innerHTML = '<div class="loading">Loading…</div>';
+    const reports = await get(`/work-reports?approval_status=${encodeURIComponent(status)}`);
+    if (!reports.length) {
+      listEl.innerHTML = `<div class="empty-state"><div class="title">Nothing here</div>No ${status.toLowerCase()} reports.</div>`;
+      return;
+    }
+    listEl.innerHTML = reports
+      .map(
+        (r, i) => `
+      <div class="list-card" style="flex-direction:column;align-items:stretch">
+        <div style="display:flex;justify-content:space-between">
+          <div class="list-card-body">
+            <div class="list-card-title">${escapeHtml(r.worker_name)}</div>
+            <div class="list-card-sub">${escapeHtml(r.site_name)} · ${escapeHtml(r.work_date)}</div>
+          </div>
+          ${statusBadge(r.approval_status)}
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-top:0.5rem">
+          <span>${r.door_count} doors</span>
+          <span class="list-card-amount">${money(r.total_amount)}</span>
+        </div>
+        <button class="btn-link" data-idx="${i}" data-action="photos" style="align-self:flex-start">Photos</button>
+        <div class="photo-strip" id="photos-${i}" style="display:none">
+          ${r.before_photos.map((p) => `<img src="${p}" alt="before" />`).join("")}
+          ${r.after_photos.map((p) => `<img src="${p}" alt="after" />`).join("")}
+        </div>
+        ${
+          status === "Pending" || status === "Correction"
+            ? `
+          <div class="actions" style="display:flex;gap:0.5rem;margin-top:0.6rem">
+            <button class="pill-btn pill-btn-sm" data-idx="${i}" data-action="approve">Approve</button>
+            <button class="pill-btn outline pill-btn-sm" data-idx="${i}" data-action="reject">Reject</button>
+            <button class="pill-btn outline pill-btn-sm" data-idx="${i}" data-action="correction">Fix</button>
+          </div>
+        `
+            : ""
+        }
+      </div>
+    `
+      )
+      .join("");
+
+    listEl.querySelectorAll('[data-action="photos"]').forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const strip = listEl.querySelector(`#photos-${btn.dataset.idx}`);
+        strip.style.display = strip.style.display === "none" ? "flex" : "none";
+      });
+    });
+    const map = { approve: "approve", reject: "reject", correction: "correction" };
+    Object.keys(map).forEach((action) => {
+      listEl.querySelectorAll(`[data-action="${action}"]`).forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const report = reports[Number(btn.dataset.idx)];
+          const remarks = prompt(`Remarks for ${action} (optional):`, "") || "";
+          try {
+            await post(`/work-reports/${report.id}/${map[action]}`, { remarks });
+            load(status);
+          } catch (err) {
+            showMessage(content, err.message, "error");
+          }
+        });
+      });
+    });
+  }
+
+  pillsEl.querySelectorAll("button").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      pillsEl.querySelectorAll("button").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      load(btn.dataset.status);
+    });
+  });
+  load("Pending");
+}
+
+async function renderWorkers(content) {
+  const workers = await get("/workers");
+  content.innerHTML = `
+    <div class="page-header-row">
+      <h1 class="page-title">Workers</h1>
+      <button class="fab" id="add-btn">+</button>
+    </div>
+    <div id="add-form-wrap" style="display:none" class="card-block">
+      <form id="add-form">
+        <label>Employee ID<input name="employee_id" required /></label>
+        <label>Name<input name="name" required /></label>
+        <label>Mobile<input name="mobile" required /></label>
+        <label>Username<input name="username" required /></label>
+        <label>Password<input name="password" type="password" required minlength="8" /></label>
+        <label>Rate/door<input name="default_rate" type="number" step="0.01" value="250" /></label>
+        <div class="error" id="add-error"></div>
+        <button type="submit" class="pill-btn">Create Worker</button>
+      </form>
+    </div>
+    <div id="worker-list">
+      ${workers
+        .map(
+          (w, i) => `
+        <button class="list-card" data-idx="${i}" style="width:100%;text-align:left;border:1px solid var(--border);cursor:pointer">
+          <div class="avatar-circle">${escapeHtml(w.name[0].toUpperCase())}</div>
+          <div class="list-card-body" style="flex:1">
+            <div class="list-card-title">${escapeHtml(w.name)}</div>
+            <div class="list-card-sub">${escapeHtml(w.employee_id)} · ${escapeHtml(w.mobile)}</div>
+          </div>
+          <div class="list-card-right">
+            <div class="list-card-amount">${money(w.default_rate)}</div>
+            <div class="list-card-meta">/door</div>
+          </div>
+        </button>
+        <div class="card-block" id="detail-${i}" style="display:none">
+          <div style="margin-bottom:0.6rem">${statusBadge(w.status)}</div>
+          <form class="edit-form" data-id="${w.id}">
+            <label>Name<input name="name" value="${escapeHtml(w.name)}" /></label>
+            <label>Mobile<input name="mobile" value="${escapeHtml(w.mobile)}" /></label>
+            <label>Rate/door<input name="default_rate" type="number" step="0.01" value="${w.default_rate}" /></label>
+            <button type="submit" class="pill-btn pill-btn-sm">Save</button>
+          </form>
+          <div class="actions" style="display:flex;gap:0.5rem;margin-top:0.75rem">
+            <button class="pill-btn outline pill-btn-sm" data-id="${w.id}" data-action="reset-pwd">Reset Password</button>
+            <button class="pill-btn outline pill-btn-sm" data-id="${w.id}" data-status="${w.status}" data-action="toggle-status">${w.status === "Active" ? "Disable" : "Activate"}</button>
+          </div>
+        </div>
+      `
+        )
+        .join("") || '<div class="empty-state"><div class="title">No workers yet</div></div>'}
+    </div>
+  `;
+
+  content.querySelector("#add-btn").addEventListener("click", () => {
+    const wrap = content.querySelector("#add-form-wrap");
+    wrap.style.display = wrap.style.display === "none" ? "block" : "none";
+  });
+  content.querySelector("#add-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const errorEl = content.querySelector("#add-error");
+    errorEl.textContent = "";
+    const fd = new FormData(e.target);
+    try {
+      await post("/workers", {
+        employee_id: fd.get("employee_id"),
+        name: fd.get("name"),
+        mobile: fd.get("mobile"),
+        username: fd.get("username"),
+        password: fd.get("password"),
+        default_rate: Number(fd.get("default_rate")),
+      });
+      renderWorkers(content);
+    } catch (err) {
+      errorEl.textContent = err.message;
+    }
+  });
+
+  content.querySelectorAll("[data-idx]").forEach((btn) => {
+    if (!btn.dataset.action) {
+      btn.addEventListener("click", () => {
+        const d = content.querySelector(`#detail-${btn.dataset.idx}`);
+        d.style.display = d.style.display === "none" ? "block" : "none";
+      });
+    }
+  });
+  content.querySelectorAll(".edit-form").forEach((form) => {
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const fd = new FormData(form);
+      try {
+        await put(`/workers/${form.dataset.id}`, {
+          name: fd.get("name"),
+          mobile: fd.get("mobile"),
+          default_rate: Number(fd.get("default_rate")),
+        });
+        renderWorkers(content);
+      } catch (err) {
+        showMessage(content, err.message, "error");
+      }
+    });
+  });
+  content.querySelectorAll('[data-action="reset-pwd"]').forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const pwd = prompt("New password (min 8 characters, leave blank for a generated default):");
+      if (pwd === null) return;
+      if (pwd && pwd.length < 8) {
+        alert("Password must be at least 8 characters");
+        return;
+      }
+      try {
+        await post(`/workers/${btn.dataset.id}/reset-password`, pwd ? { new_password: pwd } : {});
+        showMessage(content, "Password reset", "success");
+      } catch (err) {
+        showMessage(content, err.message, "error");
+      }
+    });
+  });
+  content.querySelectorAll('[data-action="toggle-status"]').forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const nextStatus = btn.dataset.status === "Active" ? "Disabled" : "Active";
+      try {
+        await put(`/workers/${btn.dataset.id}`, { status: nextStatus });
+        renderWorkers(content);
+      } catch (err) {
+        showMessage(content, err.message, "error");
+      }
+    });
+  });
+}
+
+function locationPickerHtml(idPrefix, lat, lng) {
+  return `
+    <label>Location</label>
+    <div class="map-container" id="${idPrefix}-map"></div>
+    <button type="button" class="pill-btn outline pill-btn-sm" id="${idPrefix}-locate-btn">📍 Use My Location</button>
+    <div style="display:flex;gap:0.75rem;margin-top:0.75rem">
+      <label style="flex:1">Latitude<input name="latitude" id="${idPrefix}-lat" type="number" step="0.000001" value="${lat ?? ""}" /></label>
+      <label style="flex:1">Longitude<input name="longitude" id="${idPrefix}-lng" type="number" step="0.000001" value="${lng ?? ""}" /></label>
+    </div>
+  `;
+}
+
+function wireLocationPicker(content, idPrefix, initialLat, initialLng) {
+  let picker = null;
+  const latInput = content.querySelector(`#${idPrefix}-lat`);
+  const lngInput = content.querySelector(`#${idPrefix}-lng`);
+  function ensureInit() {
+    if (!picker) {
+      picker = initLocationPicker(content.querySelector(`#${idPrefix}-map`), latInput, lngInput, initialLat, initialLng);
+    } else {
+      picker.map.invalidateSize();
+    }
+  }
+  content.querySelector(`#${idPrefix}-locate-btn`).addEventListener("click", async (e) => {
+    const btn = e.target;
+    btn.disabled = true;
+    btn.textContent = "Locating…";
+    try {
+      const pos = await getPosition();
+      ensureInit();
+      picker.applyLatLng({ lat: pos.coords.latitude, lng: pos.coords.longitude }, true);
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "📍 Use My Location";
+    }
+  });
+  return ensureInit;
+}
+
+async function renderSites(content) {
+  const sites = await get("/sites");
+  content.innerHTML = `
+    <div class="page-header-row">
+      <h1 class="page-title">Sites</h1>
+      <button class="fab" id="add-btn">+</button>
+    </div>
+    <div id="add-form-wrap" style="display:none" class="card-block">
+      <form id="add-form">
+        <label>Site Name<input name="site_name" required /></label>
+        <label>Client Name<input name="client_name" required /></label>
+        <label>Address<input name="address" required /></label>
+        ${locationPickerHtml("add-site", null, null)}
+        <label>Contact Person<input name="contact_person" /></label>
+        <label>Contact Number<input name="contact_number" /></label>
+        <div class="error" id="add-error"></div>
+        <button type="submit" class="pill-btn">Create Site</button>
+      </form>
+    </div>
+    <div id="site-list">
+      ${sites
+        .map(
+          (s, i) => `
+        <button class="list-card" data-idx="${i}" style="width:100%;text-align:left;border:1px solid var(--border);cursor:pointer">
+          <div class="list-card-body">
+            <div class="list-card-title">${escapeHtml(s.site_name)}</div>
+            <div class="list-card-sub">${escapeHtml(s.client_name)}</div>
+            <div class="list-card-meta">📍 ${escapeHtml(s.address)}</div>
+          </div>
+          <div class="list-card-right">${statusBadge(s.status)}</div>
+        </button>
+        <div class="card-block" id="detail-${i}" style="display:none">
+          <form class="edit-form" data-id="${s.id}">
+            <label>Site Name<input name="site_name" value="${escapeHtml(s.site_name)}" required /></label>
+            <label>Client Name<input name="client_name" value="${escapeHtml(s.client_name)}" required /></label>
+            <label>Address<input name="address" value="${escapeHtml(s.address)}" required /></label>
+            ${locationPickerHtml(`edit-site-${i}`, s.latitude, s.longitude)}
+            <label>Contact Person<input name="contact_person" value="${escapeHtml(s.contact_person || "")}" /></label>
+            <label>Contact Number<input name="contact_number" value="${escapeHtml(s.contact_number || "")}" /></label>
+            <label>Status
+              <select name="status">
+                <option ${s.status === "Active" ? "selected" : ""}>Active</option>
+                <option ${s.status === "Disabled" ? "selected" : ""}>Disabled</option>
+              </select>
+            </label>
+            <button type="submit" class="pill-btn pill-btn-sm">Save</button>
+          </form>
+        </div>
+      `
+        )
+        .join("") || '<div class="empty-state"><div class="title">No sites yet</div></div>'}
+    </div>
+  `;
+
+  const ensureAddMap = wireLocationPicker(content, "add-site", null, null);
+  content.querySelector("#add-btn").addEventListener("click", () => {
+    const wrap = content.querySelector("#add-form-wrap");
+    const opening = wrap.style.display === "none";
+    wrap.style.display = opening ? "block" : "none";
+    if (opening) ensureAddMap();
+  });
+  content.querySelector("#add-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const errorEl = content.querySelector("#add-error");
+    errorEl.textContent = "";
+    const fd = new FormData(e.target);
+    try {
+      await post("/sites", {
+        site_name: fd.get("site_name"),
+        client_name: fd.get("client_name"),
+        address: fd.get("address"),
+        latitude: fd.get("latitude") ? Number(fd.get("latitude")) : null,
+        longitude: fd.get("longitude") ? Number(fd.get("longitude")) : null,
+        contact_person: fd.get("contact_person"),
+        contact_number: fd.get("contact_number"),
+      });
+      renderSites(content);
+    } catch (err) {
+      errorEl.textContent = err.message;
+    }
+  });
+
+  const ensureEditMaps = sites.map((s, i) =>
+    wireLocationPicker(content, `edit-site-${i}`, s.latitude ?? null, s.longitude ?? null)
+  );
+  content.querySelectorAll("[data-idx]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const idx = Number(btn.dataset.idx);
+      const d = content.querySelector(`#detail-${idx}`);
+      const opening = d.style.display === "none";
+      d.style.display = opening ? "block" : "none";
+      if (opening) ensureEditMaps[idx]();
+    });
+  });
+  content.querySelectorAll(".edit-form").forEach((form) => {
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const fd = new FormData(form);
+      try {
+        await put(`/sites/${form.dataset.id}`, {
+          site_name: fd.get("site_name"),
+          client_name: fd.get("client_name"),
+          address: fd.get("address"),
+          latitude: fd.get("latitude") ? Number(fd.get("latitude")) : null,
+          longitude: fd.get("longitude") ? Number(fd.get("longitude")) : null,
+          contact_person: fd.get("contact_person"),
+          contact_number: fd.get("contact_number"),
+          status: fd.get("status"),
+        });
+        renderSites(content);
+      } catch (err) {
+        showMessage(content, err.message, "error");
+      }
+    });
+  });
+}
+
+async function renderMore(content, nav, logout, params, user) {
+  const [attendance, payments] = await Promise.all([
+    get("/attendance").then((a) => a.slice(0, 5)),
+    get("/payments").then((p) => p.slice(0, 5)),
+  ]);
+  content.innerHTML = `
+    <h1 class="page-title">More</h1>
+    <p class="page-subtitle">${escapeHtml(user.username)}</p>
+    <div class="tile-grid">
+      ${MORE_TILES.map((t) => `<button class="tile" data-view="${t.key}"><span class="tile-icon">${t.icon}</span><span class="tile-label">${t.label}</span></button>`).join("")}
+    </div>
+
+    <div class="section-label">Recent Attendance</div>
+    ${
+      attendance
+        .map(
+          (a) => `
+      <div class="list-card">
+        <div class="list-card-body">
+          <div class="list-card-title">${escapeHtml(a.worker_name)}</div>
+          <div class="list-card-sub">${escapeHtml(a.site_name)}</div>
+          <div class="list-card-meta">In: ${formatDateTime(a.check_in_time)}</div>
+        </div>
+        <div class="list-card-right">${a.check_out_time ? `<div class="list-card-meta">Out: ${formatDateTime(a.check_out_time).split(",")[1]}</div>` : statusBadge("Pending")}</div>
+      </div>
+    `
+        )
+        .join("") || '<div class="empty-state">No attendance yet</div>'
+    }
+
+    <div class="section-label">Recent Payments</div>
+    ${
+      payments
+        .map(
+          (p) => `
+      <div class="list-card">
+        <div class="list-card-body">
+          <div class="list-card-title">${escapeHtml(p.worker_name)}</div>
+          <div class="list-card-sub">${escapeHtml(p.payment_method)} · ${escapeHtml(p.payment_date)}</div>
+        </div>
+        <div class="list-card-amount">${money(p.amount)}</div>
+      </div>
+    `
+        )
+        .join("") || '<div class="empty-state">No payments yet</div>'
+    }
+
+    <button class="pill-btn outline" id="logout-btn" style="margin-top:1rem">Logout</button>
+  `;
+  content.querySelectorAll("[data-view]").forEach((btn) => {
+    btn.addEventListener("click", () => nav.pushView(btn.dataset.view));
+  });
+  content.querySelector("#logout-btn").addEventListener("click", logout);
+}
+
+async function renderPayout(content, nav) {
+  content.innerHTML = `
+    <div class="back-row">
+      <button class="icon-btn" id="back-btn">←</button>
+      <h1 class="page-title">Weekly Payout</h1>
+    </div>
+    <div id="payout-body"><div class="loading">Loading…</div></div>
+  `;
+  content.querySelector("#back-btn").addEventListener("click", () => nav.back("more"));
+  const body = content.querySelector("#payout-body");
+  const data = await get("/admin/payout-preview");
+  if (!data.rows.length) {
+    body.innerHTML = '<div class="empty-state"><div class="title">All settled</div>No pending payouts.</div>';
+    return;
+  }
+  body.innerHTML = `
+    <p class="page-subtitle">${money(data.total_pending)} pending across ${data.worker_count} worker(s)</p>
+    ${data.rows
+      .map(
+        (r, i) => `
+      <div class="list-card">
+        <label class="checklist-row" style="flex:1">
+          <input type="checkbox" class="payout-check" data-idx="${i}" checked />
+          <span class="list-card-body">
+            <span class="list-card-title">${escapeHtml(r.worker_name)}</span>
+            <span class="list-card-sub">${escapeHtml(r.preferred_method)} · last paid ${escapeHtml(r.last_paid_date || "-")}</span>
+          </span>
+        </label>
+        <div class="list-card-amount">${money(r.pending_amount)}</div>
+      </div>
+    `
+      )
+      .join("")}
+    <button class="pill-btn" id="pay-btn" style="margin-top:0.75rem">Pay Selected</button>
+  `;
+  body.querySelector("#pay-btn").addEventListener("click", async () => {
+    const selected = Array.from(body.querySelectorAll(".payout-check:checked")).map((c) => data.rows[Number(c.dataset.idx)]);
+    if (!selected.length) return;
+    if (!confirm(`Record ${selected.length} payment(s) totaling ${money(selected.reduce((s, r) => s + r.pending_amount, 0))}?`)) return;
+    try {
+      await post("/payments/batch", {
+        payments: selected.map((r) => ({ worker_id: r.worker_id, amount: r.pending_amount, payment_method: r.preferred_method, notes: "Batch payout" })),
+      });
+      renderPayout(content, nav);
+    } catch (err) {
+      showMessage(content, err.message, "error");
+    }
+  });
+}
+
+async function renderInvoices(content, nav) {
+  content.innerHTML = `
+    <div class="back-row">
+      <button class="icon-btn" id="back-btn">←</button>
+      <h1 class="page-title" style="flex:1">GST Invoices</h1>
+      <button class="fab" id="add-btn">+</button>
+    </div>
+    <div id="invoice-form-wrap" style="display:none" class="card-block">
+      <form id="invoice-form">
+        <label>Client Name<input name="client_name" required /></label>
+        <label>Client GSTIN<input name="client_gstin" /></label>
+        <label>Client Address<input name="client_address" /></label>
+        <label>GST Rate %<input name="gst_rate" type="number" step="0.1" value="18" /></label>
+        <div id="items"></div>
+        <button type="button" class="btn-link" id="add-item">+ Add line item</button>
+        <div class="error" id="invoice-error"></div>
+        <button type="submit" class="pill-btn" style="margin-top:0.75rem">Create Invoice</button>
+      </form>
+    </div>
+    <div id="invoice-list"></div>
+  `;
+  content.querySelector("#back-btn").addEventListener("click", () => nav.back("more"));
+
+  const itemsWrap = content.querySelector("#items");
+  function addItemRow() {
+    const row = document.createElement("div");
+    row.className = "card-block item-row";
+    row.innerHTML = `
+      <label>Description<input name="description" required /></label>
+      <label>Quantity<input name="quantity" type="number" step="1" value="1" required /></label>
+      <label>Unit Price<input name="unit_price" type="number" step="0.01" required /></label>
+      <label>HSN Code<input name="hsn_code" /></label>
+    `;
+    itemsWrap.appendChild(row);
+  }
+  addItemRow();
+  content.querySelector("#add-item").addEventListener("click", addItemRow);
+
+  const formWrap = content.querySelector("#invoice-form-wrap");
+  content.querySelector("#add-btn").addEventListener("click", () => {
+    formWrap.style.display = formWrap.style.display === "none" ? "block" : "none";
+  });
+
+  content.querySelector("#invoice-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const errorEl = content.querySelector("#invoice-error");
+    errorEl.textContent = "";
+    const fd = new FormData(e.target);
+    const items = Array.from(itemsWrap.querySelectorAll(".item-row")).map((row) => ({
+      description: row.querySelector('[name="description"]').value,
+      quantity: Number(row.querySelector('[name="quantity"]').value),
+      unit_price: Number(row.querySelector('[name="unit_price"]').value),
+      hsn_code: row.querySelector('[name="hsn_code"]').value,
+    }));
+    try {
+      await post("/invoices", {
+        client_name: fd.get("client_name"),
+        client_gstin: fd.get("client_gstin"),
+        client_address: fd.get("client_address"),
+        gst_rate: Number(fd.get("gst_rate")),
+        items,
+      });
+      renderInvoices(content, nav);
+    } catch (err) {
+      errorEl.textContent = err.message;
+    }
+  });
+
+  const invoices = await get("/invoices");
+  const listEl = content.querySelector("#invoice-list");
+  listEl.innerHTML =
+    invoices
+      .map(
+        (inv, i) => `
+    <div class="list-card" style="flex-direction:column;align-items:stretch">
+      <div style="display:flex;justify-content:space-between">
+        <div class="list-card-body">
+          <div class="list-card-title">${escapeHtml(inv.invoice_number)}</div>
+          <div class="list-card-sub">${escapeHtml(inv.client_name)} · ${escapeHtml(inv.invoice_date)}</div>
+        </div>
+        <div class="list-card-amount">${money(inv.total)}</div>
+      </div>
+      <button class="pill-btn outline pill-btn-sm" data-idx="${i}" style="align-self:flex-start;margin-top:0.5rem">Download PDF</button>
+    </div>
+  `
+      )
+      .join("") || '<div class="empty-state"><div class="title">No invoices yet</div></div>';
+  listEl.querySelectorAll("[data-idx]").forEach((btn) => {
+    btn.addEventListener("click", () => downloadWithToken(`/invoices/${invoices[Number(btn.dataset.idx)].id}/pdf`));
+  });
+}
+
+async function renderLeaves(content, nav) {
+  const filters = ["Pending", "Approved", "Rejected"];
+  content.innerHTML = `
+    <div class="back-row">
+      <button class="icon-btn" id="back-btn">←</button>
+      <h1 class="page-title">Leave Requests</h1>
+    </div>
+    <div class="filter-pills" id="filter-pills">
+      ${filters.map((f, i) => `<button class="filter-pill ${i === 0 ? "active" : ""}" data-status="${f}">${f}</button>`).join("")}
+    </div>
+    <div id="leave-list"></div>
+  `;
+  content.querySelector("#back-btn").addEventListener("click", () => nav.back("more"));
+  const listEl = content.querySelector("#leave-list");
+  async function load(status) {
+    listEl.innerHTML = '<div class="loading">Loading…</div>';
+    const leaves = await get(`/leaves?status=${encodeURIComponent(status)}`);
+    listEl.innerHTML =
+      leaves
+        .map(
+          (l, i) => `
+      <div class="list-card" style="flex-direction:column;align-items:stretch">
+        <div style="display:flex;justify-content:space-between">
+          <div class="list-card-body">
+            <div class="list-card-title">${escapeHtml(l.worker_name)}</div>
+            <div class="list-card-sub">${escapeHtml(l.start_date)} → ${escapeHtml(l.end_date)} · ${escapeHtml(l.leave_type)}</div>
+            <div class="list-card-meta">${escapeHtml(l.reason)}</div>
+          </div>
+          ${statusBadge(l.status)}
+        </div>
+        ${
+          status === "Pending"
+            ? `
+          <div class="actions" style="display:flex;gap:0.5rem;margin-top:0.6rem">
+            <button class="pill-btn pill-btn-sm" data-idx="${i}" data-action="approve">Approve</button>
+            <button class="pill-btn outline pill-btn-sm" data-idx="${i}" data-action="reject">Reject</button>
+          </div>
+        `
+            : ""
+        }
+      </div>
+    `
+        )
+        .join("") || `<div class="empty-state"><div class="title">Nothing here</div>No ${status.toLowerCase()} leave requests.</div>`;
+    const map = { approve: "approve", reject: "reject" };
+    Object.keys(map).forEach((action) => {
+      listEl.querySelectorAll(`[data-action="${action}"]`).forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const remarks = prompt(`Remarks for ${action} (optional):`, "") || "";
+          try {
+            await post(`/leaves/${leaves[Number(btn.dataset.idx)].id}/${map[action]}`, { remarks });
+            load(status);
+          } catch (err) {
+            showMessage(content, err.message, "error");
+          }
+        });
+      });
+    });
+  }
+  content.querySelector("#filter-pills").querySelectorAll("button").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      content.querySelectorAll(".filter-pill").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      load(btn.dataset.status);
+    });
+  });
+  load("Pending");
+}
+
+let _attendanceMap = null;
+
+async function renderAttendance(content, nav) {
+  const sessions = await get("/attendance");
+  content.innerHTML = `
+    <div class="back-row">
+      <button class="icon-btn" id="back-btn">←</button>
+      <h1 class="page-title">Attendance & Map</h1>
+    </div>
+    <p class="page-subtitle">Check-in locations for the most recent sessions</p>
+    <div class="map-container" id="attendance-map"></div>
+    ${sessions
+      .slice(0, 100)
+      .map(
+        (a) => `
+      <div class="list-card">
+        <div class="list-card-body">
+          <div class="list-card-title">${escapeHtml(a.worker_name)}</div>
+          <div class="list-card-sub">${escapeHtml(a.site_name)}</div>
+          <div class="list-card-meta">In: ${formatDateTime(a.check_in_time)} @ ${a.check_in_latitude?.toFixed(4)}, ${a.check_in_longitude?.toFixed(4)}</div>
+          ${a.check_out_time ? `<div class="list-card-meta">Out: ${formatDateTime(a.check_out_time)}</div>` : ""}
+        </div>
+        ${a.check_out_time ? "" : statusBadge("Pending")}
+      </div>
+    `
+      )
+      .join("") || '<div class="empty-state">No attendance records</div>'}
+  `;
+  content.querySelector("#back-btn").addEventListener("click", () => nav.back("more"));
+  initAttendanceMap(sessions.slice(0, 100));
+}
+
+function initAttendanceMap(sessions) {
+  if (_attendanceMap) {
+    _attendanceMap.remove();
+    _attendanceMap = null;
+  }
+  const points = sessions.filter((a) => typeof a.check_in_latitude === "number" && typeof a.check_in_longitude === "number");
+  const map = L.map("attendance-map", { scrollWheelZoom: false });
+  _attendanceMap = map;
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    attribution: "© OpenStreetMap contributors",
+    maxZoom: 19,
+  }).addTo(map);
+
+  if (!points.length) {
+    map.setView([12.9716, 77.5946], 11); // Bengaluru fallback
+    return;
+  }
+
+  const markers = points.map((a) => {
+    const marker = L.marker([a.check_in_latitude, a.check_in_longitude]);
+    const status = a.check_out_time ? `Checked out ${formatDateTime(a.check_out_time)}` : "Still checked in";
+    marker.bindPopup(
+      `<strong>${escapeHtml(a.worker_name)}</strong><br/>${escapeHtml(a.site_name)}<br/>In: ${formatDateTime(a.check_in_time)}<br/>${status}`
+    );
+    return marker;
+  });
+  const group = L.featureGroup(markers).addTo(map);
+  map.fitBounds(group.getBounds().pad(0.2), { maxZoom: 15 });
+}
+
+const REPORT_TYPES = [
+  { key: "worker_earnings", label: "Worker Earnings" },
+  { key: "payments", label: "Payments" },
+  { key: "attendance", label: "Attendance" },
+  { key: "site_installations", label: "Site Installations" },
+  { key: "worker_performance", label: "Worker Performance" },
+  { key: "attendance_summary", label: "Attendance Summary" },
+];
+
+async function renderReportsExport(content, nav) {
+  content.innerHTML = `
+    <div class="back-row">
+      <button class="icon-btn" id="back-btn">←</button>
+      <h1 class="page-title">Reports & Export</h1>
+    </div>
+    <div class="card-block">
+      <label>From<input type="date" id="date-from" /></label>
+      <label>To<input type="date" id="date-to" /></label>
+    </div>
+    ${REPORT_TYPES.map(
+      (r) => `
+      <div class="list-card">
+        <div class="list-card-body"><div class="list-card-title">${r.label}</div></div>
+        <div class="actions" style="display:flex;gap:0.5rem">
+          <button class="pill-btn outline pill-btn-sm" data-report="${r.key}" data-fmt="xlsx">XLSX</button>
+          <button class="pill-btn outline pill-btn-sm" data-report="${r.key}" data-fmt="pdf">PDF</button>
+        </div>
+      </div>
+    `
+    ).join("")}
+  `;
+  content.querySelector("#back-btn").addEventListener("click", () => nav.back("more"));
+  content.querySelectorAll("[data-report]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const dateFrom = content.querySelector("#date-from").value;
+      const dateTo = content.querySelector("#date-to").value;
+      const params = new URLSearchParams({ report: btn.dataset.report, fmt: btn.dataset.fmt });
+      if (dateFrom) params.set("date_from", dateFrom);
+      if (dateTo) params.set("date_to", dateTo);
+      downloadWithToken(`/reports/export?${params.toString()}`);
+    });
+  });
+}
+
+async function renderAudit(content, nav) {
+  const logs = await get("/audit-logs?limit=100");
+  content.innerHTML = `
+    <div class="back-row">
+      <button class="icon-btn" id="back-btn">←</button>
+      <h1 class="page-title">Audit Log</h1>
+    </div>
+    ${logs
+      .map(
+        (l) => `
+      <div class="list-card">
+        <div class="list-card-body">
+          <div class="list-card-title">${escapeHtml(l.action)} — ${escapeHtml(l.entity_type)}</div>
+          <div class="list-card-sub">${escapeHtml(l.user_name)}</div>
+          <div class="list-card-meta">${formatDateTime(l.created_at)}</div>
+        </div>
+      </div>
+    `
+      )
+      .join("") || '<div class="empty-state">No audit entries yet</div>'}
+  `;
+  content.querySelector("#back-btn").addEventListener("click", () => nav.back("more"));
+}
+
+async function renderSettings(content, nav) {
+  const s = await get("/settings");
+  content.innerHTML = `
+    <div class="back-row">
+      <button class="icon-btn" id="back-btn">←</button>
+      <h1 class="page-title">Settings</h1>
+    </div>
+    <form class="card-block" id="settings-form">
+      <label>Company Name<input name="company_name" value="${escapeHtml(s.company_name || "")}" /></label>
+      <label>Address<input name="address" value="${escapeHtml(s.address || "")}" /></label>
+      <label>Mobile<input name="mobile" value="${escapeHtml(s.mobile || "")}" /></label>
+      <label>Email<input name="email" value="${escapeHtml(s.email || "")}" /></label>
+      <label>Currency<input name="currency" value="${escapeHtml(s.currency || "₹")}" /></label>
+      <label>Default Rate/Door<input name="default_rate" type="number" step="0.01" value="${s.default_rate || 250}" /></label>
+      <div class="error" id="settings-error"></div>
+      <button type="submit" class="pill-btn">Save Settings</button>
+    </form>
+  `;
+  content.querySelector("#back-btn").addEventListener("click", () => nav.back("more"));
+  content.querySelector("#settings-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const errorEl = content.querySelector("#settings-error");
+    errorEl.textContent = "";
+    const fd = new FormData(e.target);
+    try {
+      await put("/settings", {
+        company_name: fd.get("company_name"),
+        address: fd.get("address"),
+        mobile: fd.get("mobile"),
+        email: fd.get("email"),
+        currency: fd.get("currency"),
+        default_rate: Number(fd.get("default_rate")),
+      });
+      showMessage(content, "Settings saved", "success");
+    } catch (err) {
+      errorEl.textContent = err.message;
+    }
+  });
+}

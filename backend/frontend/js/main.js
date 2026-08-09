@@ -74,4 +74,10 @@ function renderShell(user) {
   }
 }
 
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/sw.js").catch(() => {}); // offline shell is a nice-to-have, never block boot on it
+  });
+}
+
 boot();

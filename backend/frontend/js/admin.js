@@ -282,11 +282,8 @@ async function renderApprovals(content) {
             ? `<div class="list-card-meta">${r.door_breakdown.map((d) => `${escapeHtml(d.door_type_name)} × ${d.count}`).join(", ")}</div>`
             : ""
         }
-        <button class="btn-link" data-idx="${i}" data-action="photos" style="align-self:flex-start">Photos</button>
-        <div class="photo-strip" id="photos-${i}" style="display:none">
-          ${r.before_photos.map((p) => `<img src="${p}" alt="before" />`).join("")}
-          ${r.after_photos.map((p) => `<img src="${p}" alt="after" />`).join("")}
-        </div>
+        <button class="btn-link" data-idx="${i}" data-report-id="${r.id}" data-action="photos" style="align-self:flex-start">Photos</button>
+        <div class="photo-strip" id="photos-${i}" style="display:none"></div>
         ${
           status === "Pending" || status === "Correction"
             ? `
@@ -313,9 +310,22 @@ async function renderApprovals(content) {
       .join("");
 
     listEl.querySelectorAll('[data-action="photos"]').forEach((btn) => {
-      btn.addEventListener("click", () => {
+      btn.addEventListener("click", async () => {
         const strip = listEl.querySelector(`#photos-${btn.dataset.idx}`);
-        strip.style.display = strip.style.display === "none" ? "flex" : "none";
+        const opening = strip.style.display === "none";
+        strip.style.display = opening ? "flex" : "none";
+        if (opening && !strip.dataset.loaded) {
+          strip.innerHTML = '<div class="loading">Loading…</div>';
+          try {
+            const { before, after } = await get(`/work-reports/${btn.dataset.reportId}/photos`);
+            strip.innerHTML =
+              before.map((p) => `<img src="${p}" alt="before" />`).join("") +
+              after.map((p) => `<img src="${p}" alt="after" />`).join("");
+            strip.dataset.loaded = "1";
+          } catch (err) {
+            strip.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
+          }
+        }
       });
     });
     const map = { approve: "approve", reject: "reject", correction: "correction", unapprove: "unapprove" };

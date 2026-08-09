@@ -1015,12 +1015,28 @@ async def create_report(body: WorkReportIn, u=Depends(require_role(Role.worker, 
         door_count += item.count
         total += subtotal
     total = round(total, 2)
-    # Watermark all photos server-side
+    # Watermark all photos server-side, then store each as its own report_photos
+    # document rather than embedding them in the report — a worker submitting
+    # 15-20 photos per side would otherwise risk the report document itself
+    # bumping into MongoDB's 16MB per-document ceiling.
+    report_id = str(uuid.uuid4())
     lat_ci = sess.get("check_in_latitude")
     lng_ci = sess.get("check_in_longitude")
-    wm_before = [_watermark_photo(p, sess.get("worker_name") or "-", sess.get("site_name") or "-", lat_ci, lng_ci) for p in body.before_photos]
-    wm_after = [_watermark_photo(p, sess.get("worker_name") or "-", sess.get("site_name") or "-", lat_ci, lng_ci) for p in body.after_photos]
-    report_id = str(uuid.uuid4())
+
+    async def _store_photos(photos: list, kind: str) -> list:
+        ids = []
+        for p in photos:
+            watermarked = _watermark_photo(p, sess.get("worker_name") or "-", sess.get("site_name") or "-", lat_ci, lng_ci)
+            photo_id = str(uuid.uuid4())
+            await db.report_photos.insert_one({
+                "id": photo_id, "report_id": report_id, "kind": kind,
+                "data": watermarked, "created_at": now_utc().isoformat(),
+            })
+            ids.append(photo_id)
+        return ids
+
+    before_photo_ids = await _store_photos(body.before_photos, "before")
+    after_photo_ids = await _store_photos(body.after_photos, "after")
     doc = {
         "id": report_id,
         "session_id": body.session_id,
@@ -1035,8 +1051,8 @@ async def create_report(body: WorkReportIn, u=Depends(require_role(Role.worker, 
         "total_amount": total,
         "notes": body.notes or "",
         "work_completed": body.work_completed,
-        "before_photos": wm_before,
-        "after_photos": wm_after,
+        "before_photo_ids": before_photo_ids,
+        "after_photo_ids": after_photo_ids,
         "materials": body.materials or [],
         "approval_status": ApprovalStatus.pending.value,
         "approval_remarks": "",
@@ -1126,8 +1142,27 @@ async def withdraw_report(report_id: str, u=Depends(require_role(Role.worker))):
     if r["approval_status"] not in (ApprovalStatus.pending.value, ApprovalStatus.correction.value):
         raise HTTPException(400, "Only a Pending or Correction report can be withdrawn")
     await db.work_reports.delete_one({"id": report_id})
+    await db.report_photos.delete_many({"report_id": report_id})
     await audit(u, "delete", "work_report", report_id, r, None)
     return {"ok": True}
+
+
+@api.get("/work-reports/{report_id}/photos")
+async def get_report_photos(report_id: str, u=Depends(get_user)):
+    r = await db.work_reports.find_one({"id": report_id}, {"_id": 0})
+    if not r:
+        raise HTTPException(404, "Not found")
+    if u["role"] == Role.worker.value and r["worker_id"] != u.get("worker_id"):
+        raise HTTPException(403, "Not your report")
+    photos = await db.report_photos.find({"report_id": report_id}, {"_id": 0}).sort("created_at", 1).to_list(200)
+    if photos:
+        return {
+            "before": [p["data"] for p in photos if p["kind"] == "before"],
+            "after": [p["data"] for p in photos if p["kind"] == "after"],
+        }
+    # Legacy reports created before photos moved into their own collection still
+    # have them embedded directly on the report document — fall back to that.
+    return {"before": r.get("before_photos", []), "after": r.get("after_photos", [])}
 
 
 @api.get("/work-reports")
@@ -2604,6 +2639,7 @@ async def startup():
     await db.payments.create_index([("worker_id", 1), ("payment_date", -1)])
     await db.notifications.create_index([("user_id", 1), ("created_at", -1)])
     await db.leaves.create_index([("worker_id", 1), ("status", 1)])
+    await db.report_photos.create_index("report_id")
 
     # settings
     if not await db.settings.find_one({"id": "global"}):
@@ -2731,7 +2767,7 @@ async def startup():
                 "total_amount": 8 * w["default_rate"],
                 "notes": "All 8 main entrance doors installed",
                 "work_completed": True,
-                "before_photos": [], "after_photos": [],
+                "before_photo_ids": [], "after_photo_ids": [],
                 "approval_status": "Approved",
                 "approval_remarks": "Verified, good work",
                 "approved_by": admin_id, "approved_by_name": "Admin",

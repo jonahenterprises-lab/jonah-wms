@@ -422,7 +422,7 @@ async function renderReportForm(content, user, nav, logout, params) {
           after_photos: afterPhotos,
           client_sync_id: uuid(),
         },
-        { timeoutMs: 120000 } // photo uploads over slow mobile data need more room than the 30s default
+        { timeoutMs: 300000 } // a full 15-20-photo-per-side submission over slow mobile data needs real headroom over the 30s default
       );
       nav.goTab("reports");
     } catch (err) {
@@ -466,11 +466,8 @@ async function renderReports(content, user, nav) {
           }
           ${r.notes ? `<div class="list-card-meta">Note: ${escapeHtml(r.notes)}</div>` : ""}
           ${r.approval_remarks ? `<div class="list-card-meta">Remarks: ${escapeHtml(r.approval_remarks)}</div>` : ""}
-          <button class="btn-link" data-idx="${i}" data-action="photos" style="align-self:flex-start;margin-top:0.4rem">View Photos</button>
-          <div class="photo-strip" id="photos-${i}" style="display:none">
-            ${r.before_photos.map((p) => `<img src="${p}" alt="before" />`).join("")}
-            ${r.after_photos.map((p) => `<img src="${p}" alt="after" />`).join("")}
-          </div>
+          <button class="btn-link" data-idx="${i}" data-report-id="${r.id}" data-action="photos" style="align-self:flex-start;margin-top:0.4rem">View Photos</button>
+          <div class="photo-strip" id="photos-${i}" style="display:none"></div>
           ${
             editable(r)
               ? `
@@ -509,9 +506,22 @@ async function renderReports(content, user, nav) {
     </div>
   `;
   content.querySelectorAll('[data-action="photos"]').forEach((btn) => {
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", async () => {
       const strip = content.querySelector(`#photos-${btn.dataset.idx}`);
-      strip.style.display = strip.style.display === "none" ? "flex" : "none";
+      const opening = strip.style.display === "none";
+      strip.style.display = opening ? "flex" : "none";
+      if (opening && !strip.dataset.loaded) {
+        strip.innerHTML = '<div class="loading">Loading…</div>';
+        try {
+          const { before, after } = await get(`/work-reports/${btn.dataset.reportId}/photos`);
+          strip.innerHTML =
+            before.map((p) => `<img src="${p}" alt="before" />`).join("") +
+            after.map((p) => `<img src="${p}" alt="after" />`).join("");
+          strip.dataset.loaded = "1";
+        } catch (err) {
+          strip.innerHTML = `<div class="error">${escapeHtml(err.message)}</div>`;
+        }
+      }
     });
   });
   content.querySelectorAll('[data-action="edit"]').forEach((btn) => {

@@ -304,7 +304,11 @@ async function renderSites(content, user, nav) {
 
 async function renderReportForm(content, user, nav, logout, params) {
   const session = params.session;
-  const doorTypes = await get("/door-types"); // Active only, per backend filtering for Worker role
+  const [doorTypes, progress] = await Promise.all([
+    get("/door-types"), // Active only, per backend filtering for Worker role
+    get(`/sites/${session.site_id}/progress`).catch(() => []),
+  ]);
+  const progressById = Object.fromEntries(progress.map((p) => [p.door_type_id, p]));
   content.innerHTML = `
     <div class="back-row">
       <button class="icon-btn" id="back-btn">←</button>
@@ -318,14 +322,20 @@ async function renderReportForm(content, user, nav, logout, params) {
         doorTypes.length === 0
           ? '<p class="error">No door types configured — ask your admin to add one before submitting a report.</p>'
           : doorTypes
-              .map(
-                (t) => `
-        <div style="display:flex;align-items:center;gap:0.6rem;margin-bottom:0.6rem">
-          <span style="flex:1">${escapeHtml(t.name)}</span>
-          <input type="number" min="0" step="1" value="0" style="width:90px" class="door-type-count" data-id="${t.id}" data-name="${escapeHtml(t.name)}" />
+              .map((t) => {
+                const p = progressById[t.id];
+                const hasLimit = p && p.target != null;
+                return `
+        <div style="margin-bottom:0.6rem">
+          <div style="display:flex;align-items:center;gap:0.6rem">
+            <span style="flex:1">${escapeHtml(t.name)}</span>
+            <input type="number" min="0" ${hasLimit ? `max="${p.remaining}"` : ""} step="1" value="0" style="width:90px"
+              class="door-type-count" data-id="${t.id}" data-name="${escapeHtml(t.name)}" data-remaining="${hasLimit ? p.remaining : ""}" />
+          </div>
+          ${hasLimit ? `<div class="file-hint" style="margin-top:0.2rem">${p.remaining} remaining (target ${p.target}, ${p.installed} recorded)</div>` : ""}
         </div>
-      `
-              )
+      `;
+              })
               .join("")
       }
 
@@ -366,7 +376,15 @@ async function renderReportForm(content, user, nav, logout, params) {
       errorEl.textContent = "At least 1 before and 1 after photo required";
       return;
     }
-    const doors = Array.from(content.querySelectorAll(".door-type-count"))
+    const countInputs = Array.from(content.querySelectorAll(".door-type-count"));
+    for (const inp of countInputs) {
+      const remaining = inp.dataset.remaining;
+      if (remaining !== "" && Number(inp.value) > Number(remaining)) {
+        errorEl.textContent = `Only ${remaining} ${inp.dataset.name} remaining at this site — lower the count or ask an admin to raise the target.`;
+        return;
+      }
+    }
+    const doors = countInputs
       .map((inp) => ({ door_type_id: inp.dataset.id, count: Number(inp.value) || 0 }))
       .filter((d) => d.count > 0);
     if (!doors.length) {

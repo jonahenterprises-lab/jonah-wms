@@ -1,5 +1,5 @@
 import { get, post, put, del } from "./api.js";
-import { getPosition, money, escapeHtml, formatDateTime, showMessage, statusBadge } from "./utils.js";
+import { getPosition, uuid, money, escapeHtml, formatDateTime, showMessage, statusBadge } from "./utils.js";
 
 const DEFAULT_MAP_CENTER = [12.9716, 77.5946]; // Bengaluru fallback
 
@@ -524,6 +524,35 @@ function collectDoorRateOverrides(form, idPrefix, doorTypes) {
   return rates;
 }
 
+function targetDoorsHtml(idPrefix, doorTypes, existingTargets) {
+  if (!doorTypes.length) return "";
+  return `
+    <label>Assigned Quantity (blank = no limit for that type)</label>
+    <div class="card-block" style="padding:0.75rem">
+      ${doorTypes
+        .map(
+          (t) => `
+        <div style="display:flex;align-items:center;gap:0.6rem;margin-bottom:0.5rem">
+          <span style="flex:1;font-size:0.85rem">${escapeHtml(t.name)}</span>
+          <input type="number" step="1" min="0" style="width:90px" name="${idPrefix}-target-${t.id}"
+            value="${existingTargets[t.id] ?? ""}" placeholder="No limit" />
+        </div>
+      `
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function collectTargetDoors(form, idPrefix, doorTypes) {
+  const targets = {};
+  doorTypes.forEach((t) => {
+    const input = form.querySelector(`[name="${idPrefix}-target-${t.id}"]`);
+    if (input && input.value !== "") targets[t.id] = Number(input.value);
+  });
+  return targets;
+}
+
 async function renderSites(content) {
   const [sites, doorTypes] = await Promise.all([get("/sites"), get("/door-types")]);
   content.innerHTML = `
@@ -540,6 +569,7 @@ async function renderSites(content) {
         <label>Contact Person<input name="contact_person" /></label>
         <label>Contact Number<input name="contact_number" /></label>
         ${doorRateOverridesHtml("add-site", doorTypes, {})}
+        ${targetDoorsHtml("add-site", doorTypes, {})}
         <div class="error" id="add-error"></div>
         <button type="submit" class="pill-btn">Create Site</button>
       </form>
@@ -565,6 +595,7 @@ async function renderSites(content) {
             <label>Contact Person<input name="contact_person" value="${escapeHtml(s.contact_person || "")}" /></label>
             <label>Contact Number<input name="contact_number" value="${escapeHtml(s.contact_number || "")}" /></label>
             ${doorRateOverridesHtml(`edit-site-${i}`, doorTypes, s.door_type_rates || {})}
+            ${targetDoorsHtml(`edit-site-${i}`, doorTypes, s.target_doors || {})}
             <label>Status
               <select name="status">
                 <option ${s.status === "Active" ? "selected" : ""}>Active</option>
@@ -602,6 +633,7 @@ async function renderSites(content) {
         contact_person: fd.get("contact_person"),
         contact_number: fd.get("contact_number"),
         door_type_rates: collectDoorRateOverrides(e.target, "add-site", doorTypes),
+        target_doors: collectTargetDoors(e.target, "add-site", doorTypes),
       });
       renderSites(content);
     } catch (err) {
@@ -636,6 +668,7 @@ async function renderSites(content) {
           contact_number: fd.get("contact_number"),
           status: fd.get("status"),
           door_type_rates: collectDoorRateOverrides(form, `edit-site-${form.dataset.idx}`, doorTypes),
+          target_doors: collectTargetDoors(form, `edit-site-${form.dataset.idx}`, doorTypes),
         });
         renderSites(content);
       } catch (err) {
@@ -715,6 +748,9 @@ async function renderPayout(content, nav) {
     body.innerHTML = '<div class="empty-state"><div class="title">All settled</div>No pending payouts.</div>';
     return;
   }
+  // Generated once per screen load and reused across retries of the same click —
+  // if a request fails and the admin tries again, it's still treated as one batch.
+  const batchSyncId = uuid();
   body.innerHTML = `
     <p class="page-subtitle">${money(data.total_pending)} pending across ${data.worker_count} worker(s)</p>
     ${data.rows
@@ -735,17 +771,23 @@ async function renderPayout(content, nav) {
       .join("")}
     <button class="pill-btn" id="pay-btn" style="margin-top:0.75rem">Pay Selected</button>
   `;
-  body.querySelector("#pay-btn").addEventListener("click", async () => {
+  body.querySelector("#pay-btn").addEventListener("click", async (e) => {
+    const btn = e.target;
     const selected = Array.from(body.querySelectorAll(".payout-check:checked")).map((c) => data.rows[Number(c.dataset.idx)]);
     if (!selected.length) return;
     if (!confirm(`Record ${selected.length} payment(s) totaling ${money(selected.reduce((s, r) => s + r.pending_amount, 0))}?`)) return;
+    btn.disabled = true;
+    btn.textContent = "Recording…";
     try {
       await post("/payments/batch", {
         payments: selected.map((r) => ({ worker_id: r.worker_id, amount: r.pending_amount, payment_method: r.preferred_method, notes: "Batch payout" })),
+        client_sync_id: batchSyncId,
       });
       renderPayout(content, nav);
     } catch (err) {
       showMessage(content, err.message, "error");
+      btn.disabled = false;
+      btn.textContent = "Pay Selected";
     }
   });
 }

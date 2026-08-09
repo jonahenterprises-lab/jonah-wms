@@ -154,6 +154,7 @@ class SiteIn(BaseModel):
     status: str = "Active"
     notes: Optional[str] = ""
     door_type_rates: dict = {}  # {door_type_id: rate} — per-site override of a door type's default rate
+    target_doors: dict = {}  # {door_type_id: assigned_count} — omitted key = no ceiling for that type
 
 
 class DoorTypeIn(BaseModel):
@@ -208,6 +209,7 @@ class PaymentIn(BaseModel):
     payment_method: str = "Cash"
     transaction_reference: Optional[str] = ""
     notes: Optional[str] = ""
+    client_sync_id: Optional[str] = None  # idempotency — a double-click must not double-pay
 
 
 class SettingsIn(BaseModel):
@@ -296,6 +298,21 @@ async def get_effective_rate(worker_id: str, site_id: str) -> float:
     if settings and settings.get("default_rate"):
         return float(settings["default_rate"])
     return 250.0
+
+
+async def get_installed_count(site_id: str, door_type_id: str) -> int:
+    """Sum of this door type already recorded at this site across every report that
+    isn't Rejected — Pending/Correction count too, so the ceiling can't be worked
+    around by racing multiple pending submissions ahead of admin review."""
+    total = 0
+    async for r in db.work_reports.find(
+        {"site_id": site_id, "approval_status": {"$ne": ApprovalStatus.rejected.value}},
+        {"_id": 0, "door_breakdown": 1},
+    ):
+        for item in r.get("door_breakdown", []):
+            if item.get("door_type_id") == door_type_id:
+                total += item.get("count", 0)
+    return total
 
 
 async def add_notification(user_id: str, title: str, message: str, action_url: Optional[str] = None):
@@ -568,6 +585,30 @@ async def update_door_type(door_type_id: str, body: DoorTypeIn, u=Depends(requir
     return {**old, **upd}
 
 
+@api.get("/sites/{site_id}/progress")
+async def site_door_progress(site_id: str, u=Depends(get_user)):
+    """Per-door-type target/installed/remaining at this site, for door types that
+    have a target set. Lets the report form show remaining quantity before a
+    worker submits, instead of only rejecting after the fact."""
+    site = await db.sites.find_one({"id": site_id}, {"_id": 0})
+    if not site:
+        raise HTTPException(404, "Site not found")
+    targets = site.get("target_doors", {}) or {}
+    door_types = await db.door_types.find({"status": "Active"}, {"_id": 0}).to_list(200)
+    rows = []
+    for dt in door_types:
+        target = targets.get(dt["id"])
+        installed = await get_installed_count(site_id, dt["id"]) if target is not None else None
+        rows.append({
+            "door_type_id": dt["id"],
+            "door_type_name": dt["name"],
+            "target": target,
+            "installed": installed,
+            "remaining": max(target - installed, 0) if target is not None else None,
+        })
+    return rows
+
+
 # --- Workers -------------------------------------------------------------
 @api.get("/workers")
 async def list_workers(u=Depends(require_role(Role.admin))):
@@ -767,6 +808,26 @@ async def create_report(body: WorkReportIn, u=Depends(require_role(Role.worker, 
         raise HTTPException(400, "At least 1 before and 1 after photo required")
     if any(_photo_too_large(p) for p in body.before_photos + body.after_photos):
         raise HTTPException(400, "One or more photos exceed the size limit (~9MB each)")
+    # Enforce each door type's assigned quantity at this site, if the admin set one.
+    # Checked before touching photos so a worker gets fast feedback instead of a
+    # rejection after already uploading evidence for a count that was never going in.
+    site = await db.sites.find_one({"id": sess["site_id"]}, {"_id": 0})
+    targets = (site or {}).get("target_doors", {}) or {}
+    for item in body.doors:
+        target = targets.get(item.door_type_id)
+        if target is None:
+            continue
+        installed = await get_installed_count(sess["site_id"], item.door_type_id)
+        remaining = target - installed
+        if item.count > remaining:
+            door_type = await db.door_types.find_one({"id": item.door_type_id}, {"_id": 0})
+            type_name = door_type["name"] if door_type else "this door type"
+            raise HTTPException(
+                400,
+                f"Only {max(remaining, 0)} {type_name} remaining at this site "
+                f"(target: {target}, already recorded: {installed}). Ask an admin to "
+                f"raise the target if this is intentional.",
+            )
     # server-computed breakdown & total (never trust client-supplied rates)
     door_breakdown = []
     door_count = 0
@@ -908,6 +969,11 @@ async def correction_report(report_id: str, body: ApprovalIn, u=Depends(require_
 async def create_payment(body: PaymentIn, u=Depends(require_role(Role.admin))):
     if body.amount <= 0:
         raise HTTPException(400, "Amount must be positive")
+    # idempotency — a double-click or slow-network retry must not double-pay a worker
+    if body.client_sync_id:
+        existing = await db.payments.find_one({"client_sync_id": body.client_sync_id}, {"_id": 0})
+        if existing:
+            return existing
     worker = await db.workers.find_one({"id": body.worker_id}, {"_id": 0})
     if not worker:
         raise HTTPException(404, "Worker not found")
@@ -923,6 +989,8 @@ async def create_payment(body: PaymentIn, u=Depends(require_role(Role.admin))):
         "created_by": u["id"],
         "created_at": now_utc().isoformat(),
     }
+    if body.client_sync_id:
+        doc["client_sync_id"] = body.client_sync_id
     await db.payments.insert_one(doc.copy())
     await audit(u, "create", "payment", doc["id"], None, doc)
     # notify worker
@@ -1208,6 +1276,8 @@ class BatchPayItem(BaseModel):
 class BatchPayIn(BaseModel):
     payments: List[BatchPayItem]
     payment_date: Optional[str] = None
+    client_sync_id: Optional[str] = None  # idempotency for the whole batch, distinct from
+    # per-payment client_sync_id since one batch legitimately creates several payment docs
 
 
 @api.post("/payments/batch")
@@ -1215,6 +1285,11 @@ async def batch_payments(body: BatchPayIn, u=Depends(require_role(Role.admin))):
     """Create multiple payment entries in one call — used by the weekly payout screen."""
     if not body.payments:
         raise HTTPException(400, "No payments provided")
+    # idempotency — a double-click on "Pay Selected" must not re-run the whole batch
+    if body.client_sync_id:
+        existing = await db.payments.find({"batch_sync_id": body.client_sync_id}, {"_id": 0}).to_list(1000)
+        if existing:
+            return {"created": len(existing), "payments": existing}
     date = body.payment_date or now_utc().date().isoformat()
     created = []
     for item in body.payments:
@@ -1233,6 +1308,8 @@ async def batch_payments(body: BatchPayIn, u=Depends(require_role(Role.admin))):
             "created_by": u["id"],
             "created_at": now_utc().isoformat(),
         }
+        if body.client_sync_id:
+            doc["batch_sync_id"] = body.client_sync_id
         await db.payments.insert_one(doc.copy())
         await audit(u, "create", "payment", doc["id"], None, doc)
         wu = await db.users.find_one({"worker_id": item.worker_id}, {"_id": 0, "id": 1})
@@ -2118,7 +2195,7 @@ async def startup():
     await db.used_download_tokens.create_index("expires_at", expireAfterSeconds=0)
     # Use partial index so only actual string sync_ids are enforced unique
     # (sparse indexes do NOT skip null values — they only skip missing fields).
-    for coll_name in ("attendance_sessions", "work_reports"):
+    for coll_name in ("attendance_sessions", "work_reports", "payments"):
         coll = db[coll_name]
         # Drop stale sparse index if present, then recreate as partial.
         try:

@@ -6,6 +6,7 @@ work reports with photo evidence, admin approval workflow, payment ledger.
 
 import os
 import io
+import asyncio
 import base64
 import math
 import secrets
@@ -2444,6 +2445,70 @@ async def export_report(
 
 
 # --- Startup / seed ------------------------------------------------------
+# --- Time-based reminders --------------------------------------------------
+REMINDER_INTERVAL_SECONDS = 1800  # 30 min — reminders are hours-scale, no need to poll tighter
+OPEN_SESSION_REMINDER_HOURS = 12  # a normal shift is a few hours; 12+ almost certainly forgotten
+
+
+async def remind_open_sessions():
+    """A worker still checked in this long almost certainly forgot to check
+    out (or the app died in the background) — nudge them and their admin
+    once. reminder_sent guards against re-notifying every tick."""
+    cutoff = (now_utc() - timedelta(hours=OPEN_SESSION_REMINDER_HOURS)).isoformat()
+    cursor = db.attendance_sessions.find(
+        {"check_out_time": None, "check_in_time": {"$lt": cutoff}, "reminder_sent": {"$ne": True}},
+        {"_id": 0},
+    )
+    async for sess in cursor:
+        worker_user = await db.users.find_one({"worker_id": sess["worker_id"]}, {"_id": 0, "id": 1})
+        if worker_user:
+            await add_notification(
+                worker_user["id"], "Still checked in",
+                f"You've been checked in at {sess['site_name']} since {formatted_ist(sess['check_in_time'])}. Don't forget to check out.",
+            )
+        async for admin in db.users.find({"role": Role.admin.value}, {"_id": 0, "id": 1}):
+            await add_notification(
+                admin["id"], "Worker still checked in",
+                f"{sess['worker_name']} has been checked in at {sess['site_name']} since {formatted_ist(sess['check_in_time'])} and hasn't checked out.",
+            )
+        await db.attendance_sessions.update_one({"id": sess["id"]}, {"$set": {"reminder_sent": True}})
+
+
+async def remind_stale_pending_approvals():
+    """One reminder per calendar day (IST), not per tick — a digest, not spam."""
+    today = datetime.now(IST).date().isoformat()
+    settings = await db.settings.find_one({"id": "global"}, {"_id": 0, "last_pending_reminder_date": 1}) or {}
+    if settings.get("last_pending_reminder_date") == today:
+        return
+    cutoff = (now_utc() - timedelta(hours=24)).isoformat()
+    count = await db.work_reports.count_documents({"approval_status": "Pending", "created_at": {"$lt": cutoff}})
+    if not count:
+        return  # nothing stale yet — leave last_pending_reminder_date unset so a later tick today can still fire
+    async for admin in db.users.find({"role": Role.admin.value}, {"_id": 0, "id": 1}):
+        await add_notification(
+            admin["id"], "Pending approvals",
+            f"{count} work report(s) have been waiting over a day for approval.",
+        )
+    await db.settings.update_one({"id": "global"}, {"$set": {"last_pending_reminder_date": today}}, upsert=True)
+
+
+def formatted_ist(iso_str: str) -> str:
+    dt = datetime.fromisoformat(iso_str)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(IST).strftime("%d %b, %I:%M %p")
+
+
+async def reminder_loop():
+    while True:
+        try:
+            await remind_open_sessions()
+            await remind_stale_pending_approvals()
+        except Exception as e:
+            logger.warning(f"reminder loop error (non-blocking): {e}")
+        await asyncio.sleep(REMINDER_INTERVAL_SECONDS)
+
+
 @app.on_event("startup")
 async def startup():
     await db.users.create_index("username", unique=True)
@@ -2625,9 +2690,14 @@ async def startup():
             })
             logger.info("Seeded sample report & payment")
 
+    app.state.reminder_task = asyncio.create_task(reminder_loop())
+
 
 @app.on_event("shutdown")
 async def shutdown():
+    task = getattr(app.state, "reminder_task", None)
+    if task:
+        task.cancel()
     client.close()
 
 

@@ -49,6 +49,7 @@ const MORE_TILES = [
   { key: "reports", icon: "⬇️", label: "Reports & Export" },
   { key: "audit", icon: "🛡️", label: "Audit Log" },
   { key: "doortypes", icon: "🚪", label: "Door Types" },
+  { key: "notifications", icon: "🔔", label: "Notifications" },
   { key: "settings", icon: "⚙️", label: "Settings" },
   { key: "changepwd", icon: "🔑", label: "Change Password" },
 ];
@@ -102,6 +103,7 @@ export function renderAdmin(frame, user, logout) {
     reports: renderReportsExport,
     audit: renderAudit,
     doortypes: renderDoorTypes,
+    notifications: renderNotifications,
     settings: renderSettings,
     changepwd: renderChangePassword,
   };
@@ -1272,6 +1274,42 @@ async function renderReportsExport(content, nav) {
       if (dateTo) params.set("date_to", dateTo);
       downloadWithToken(`/reports/export?${params.toString()}`);
     });
+  });
+}
+
+async function renderNotifications(content, nav) {
+  const notifications = await get("/notifications");
+  content.innerHTML = `
+    <div class="back-row">
+      <button class="icon-btn" id="back-btn">←</button>
+      <h1 class="page-title" style="flex:1">Notifications</h1>
+      ${notifications.some((n) => !n.is_read) ? `<button class="btn-link" id="read-all-btn">Mark all read</button>` : ""}
+    </div>
+    <div id="notif-list">
+      ${
+        notifications
+          .map(
+            (n) => `
+        <div class="list-card" style="flex-direction:column;align-items:stretch;${n.is_read ? "opacity:0.6" : ""}">
+          <div class="list-card-title">${escapeHtml(n.title)}</div>
+          <div class="list-card-sub">${escapeHtml(n.message)}</div>
+          <div class="list-card-meta">${formatDateTime(n.created_at)}</div>
+        </div>
+      `
+          )
+          .join("") || '<div class="empty-state"><div class="title">No notifications</div></div>'
+      }
+    </div>
+  `;
+  content.querySelector("#back-btn").addEventListener("click", () => nav.back("more"));
+  content.querySelector("#read-all-btn")?.addEventListener("click", async (e) => {
+    e.target.disabled = true;
+    try {
+      await post("/notifications/read-all", {});
+      renderNotifications(content, nav);
+    } catch (err) {
+      showMessage(content, err.message, "error");
+    }
   });
 }
 

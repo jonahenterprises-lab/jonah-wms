@@ -1962,7 +1962,7 @@ def _build_invoice_pdf(inv: dict, company: dict) -> bytes:
 @api.get("/invoices/{iid}/pdf")
 async def invoice_pdf(iid: str, token: Optional[str] = None):
     if not token: raise HTTPException(401, "Missing download token")
-    await _verify_download_token(token)
+    await _verify_admin_download_token(token)
     inv = await db.invoices.find_one({"id": iid}, {"_id": 0})
     if not inv: raise HTTPException(404, "Not found")
     company = await _company_settings()
@@ -2401,6 +2401,17 @@ async def _verify_download_token(token: str) -> dict:
     return p
 
 
+async def _verify_admin_download_token(token: str) -> dict:
+    """Like _verify_download_token, but additionally rejects any token not
+    minted by an Admin. Invoice PDFs and report exports must never accept a
+    worker-scoped salary-slip token — that token is only meant to be valid
+    for that one worker's own slip, not for company-wide data."""
+    payload = await _verify_download_token(token)
+    if payload.get("role") != Role.admin.value:
+        raise HTTPException(403, "Forbidden")
+    return payload
+
+
 @api.post("/reports/download-token")
 async def create_download_token(u=Depends(require_role(Role.admin))):
     """Short-lived download token used by the mobile client to open export URLs."""
@@ -2508,7 +2519,7 @@ async def export_report(
     # can't easily attach custom headers.
     if not token:
         raise HTTPException(401, "Missing download token")
-    await _verify_download_token(token)
+    await _verify_admin_download_token(token)
 
     header, rows, footer, title = await _resolve_report(report, {
         "date_from": date_from, "date_to": date_to, "worker_id": worker_id, "site_id": site_id,

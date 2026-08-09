@@ -238,16 +238,24 @@ async function renderApprovals(content) {
     <div class="filter-pills" id="filter-pills">
       ${filters.map((f, i) => `<button class="filter-pill ${i === 0 ? "active" : ""}" data-status="${f}">${f}</button>`).join("")}
     </div>
+    <input type="search" id="report-search" placeholder="Search by worker or site…" style="margin-bottom:0.75rem" />
     <div id="report-list"></div>
   `;
   const listEl = content.querySelector("#report-list");
   const pillsEl = content.querySelector("#filter-pills");
+  const searchEl = content.querySelector("#report-search");
+  let currentStatus = "Pending";
 
   async function load(status) {
+    currentStatus = status;
     listEl.innerHTML = '<div class="loading">Loading…</div>';
-    const reports = await get(`/work-reports?approval_status=${encodeURIComponent(status)}`);
+    const all = await get(`/work-reports?approval_status=${encodeURIComponent(status)}`);
+    const q = searchEl.value.trim().toLowerCase();
+    const reports = q
+      ? all.filter((r) => r.worker_name.toLowerCase().includes(q) || r.site_name.toLowerCase().includes(q))
+      : all;
     if (!reports.length) {
-      listEl.innerHTML = `<div class="empty-state"><div class="title">Nothing here</div>No ${status.toLowerCase()} reports.</div>`;
+      listEl.innerHTML = `<div class="empty-state"><div class="title">Nothing here</div>No ${status.toLowerCase()} reports${q ? " match your search" : ""}.</div>`;
       return;
     }
     listEl.innerHTML = reports
@@ -331,6 +339,7 @@ async function renderApprovals(content) {
       load(btn.dataset.status);
     });
   });
+  searchEl.addEventListener("input", () => load(currentStatus));
   load("Pending");
 }
 
@@ -341,6 +350,7 @@ async function renderWorkers(content) {
       <h1 class="page-title">Workers</h1>
       <button class="fab" id="add-btn">+</button>
     </div>
+    <input type="search" id="worker-search" placeholder="Search by name, employee ID, or mobile…" style="margin-bottom:0.75rem" />
     <div id="add-form-wrap" style="display:none" class="card-block">
       <form id="add-form">
         <label>Employee ID<input name="employee_id" required /></label>
@@ -353,8 +363,13 @@ async function renderWorkers(content) {
         <button type="submit" class="pill-btn">Create Worker</button>
       </form>
     </div>
-    <div id="worker-list">
-      ${workers
+    <div id="worker-list"></div>
+  `;
+
+  const listEl = content.querySelector("#worker-list");
+  function renderList(items) {
+    listEl.innerHTML =
+      items
         .map(
           (w, i) => `
         <button class="list-card" data-idx="${i}" style="width:100%;text-align:left;border:1px solid var(--border);cursor:pointer">
@@ -383,9 +398,80 @@ async function renderWorkers(content) {
         </div>
       `
         )
-        .join("") || '<div class="empty-state"><div class="title">No workers yet</div></div>'}
-    </div>
-  `;
+        .join("") ||
+      `<div class="empty-state"><div class="title">${workers.length ? "No matches" : "No workers yet"}</div></div>`;
+    wireList(items);
+  }
+
+  function wireList(items) {
+    listEl.querySelectorAll("[data-idx]").forEach((btn) => {
+      if (!btn.dataset.action) {
+        btn.addEventListener("click", () => {
+          const d = listEl.querySelector(`#detail-${btn.dataset.idx}`);
+          d.style.display = d.style.display === "none" ? "block" : "none";
+        });
+      }
+    });
+    listEl.querySelectorAll(".edit-form").forEach((form) => {
+      form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const fd = new FormData(form);
+        try {
+          await put(`/workers/${form.dataset.id}`, {
+            name: fd.get("name"),
+            mobile: fd.get("mobile"),
+            default_rate: Number(fd.get("default_rate")),
+          });
+          renderWorkers(content);
+        } catch (err) {
+          showMessage(content, err.message, "error");
+        }
+      });
+    });
+    listEl.querySelectorAll('[data-action="reset-pwd"]').forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const id = btn.dataset.id;
+        const pwd = prompt("New password (min 8 characters, leave blank for a generated default):");
+        if (pwd === null) return;
+        if (pwd && pwd.length < 8) {
+          alert("Password must be at least 8 characters");
+          return;
+        }
+        try {
+          await post(`/workers/${id}/reset-password`, pwd ? { new_password: pwd } : {});
+          showMessage(content, "Password reset", "success");
+        } catch (err) {
+          showMessage(content, err.message, "error");
+        }
+      });
+    });
+    listEl.querySelectorAll('[data-action="toggle-status"]').forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const nextStatus = btn.dataset.status === "Active" ? "Disabled" : "Active";
+        try {
+          await put(`/workers/${btn.dataset.id}`, { status: nextStatus });
+          renderWorkers(content);
+        } catch (err) {
+          showMessage(content, err.message, "error");
+        }
+      });
+    });
+  }
+
+  renderList(workers);
+  content.querySelector("#worker-search").addEventListener("input", (e) => {
+    const q = e.target.value.trim().toLowerCase();
+    renderList(
+      q
+        ? workers.filter(
+            (w) =>
+              w.name.toLowerCase().includes(q) ||
+              w.employee_id.toLowerCase().includes(q) ||
+              (w.mobile || "").toLowerCase().includes(q)
+          )
+        : workers
+    );
+  });
 
   content.querySelector("#add-btn").addEventListener("click", () => {
     const wrap = content.querySelector("#add-form-wrap");
@@ -409,58 +495,6 @@ async function renderWorkers(content) {
     } catch (err) {
       errorEl.textContent = err.message;
     }
-  });
-
-  content.querySelectorAll("[data-idx]").forEach((btn) => {
-    if (!btn.dataset.action) {
-      btn.addEventListener("click", () => {
-        const d = content.querySelector(`#detail-${btn.dataset.idx}`);
-        d.style.display = d.style.display === "none" ? "block" : "none";
-      });
-    }
-  });
-  content.querySelectorAll(".edit-form").forEach((form) => {
-    form.addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const fd = new FormData(form);
-      try {
-        await put(`/workers/${form.dataset.id}`, {
-          name: fd.get("name"),
-          mobile: fd.get("mobile"),
-          default_rate: Number(fd.get("default_rate")),
-        });
-        renderWorkers(content);
-      } catch (err) {
-        showMessage(content, err.message, "error");
-      }
-    });
-  });
-  content.querySelectorAll('[data-action="reset-pwd"]').forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const pwd = prompt("New password (min 8 characters, leave blank for a generated default):");
-      if (pwd === null) return;
-      if (pwd && pwd.length < 8) {
-        alert("Password must be at least 8 characters");
-        return;
-      }
-      try {
-        await post(`/workers/${btn.dataset.id}/reset-password`, pwd ? { new_password: pwd } : {});
-        showMessage(content, "Password reset", "success");
-      } catch (err) {
-        showMessage(content, err.message, "error");
-      }
-    });
-  });
-  content.querySelectorAll('[data-action="toggle-status"]').forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const nextStatus = btn.dataset.status === "Active" ? "Disabled" : "Active";
-      try {
-        await put(`/workers/${btn.dataset.id}`, { status: nextStatus });
-        renderWorkers(content);
-      } catch (err) {
-        showMessage(content, err.message, "error");
-      }
-    });
   });
 }
 
@@ -570,6 +604,7 @@ async function renderSites(content) {
       <h1 class="page-title">Sites</h1>
       <button class="fab" id="add-btn">+</button>
     </div>
+    <input type="search" id="site-search" placeholder="Search by name, client, or address…" style="margin-bottom:0.75rem" />
     <div id="add-form-wrap" style="display:none" class="card-block">
       <form id="add-form">
         <label>Site Name<input name="site_name" required /></label>
@@ -584,6 +619,7 @@ async function renderSites(content) {
         <button type="submit" class="pill-btn">Create Site</button>
       </form>
     </div>
+    <div class="empty-state" id="site-no-match" style="display:none"><div class="title">No matches</div></div>
     <div id="site-list">
       ${sites
         .map(
@@ -685,6 +721,28 @@ async function renderSites(content) {
         showMessage(content, err.message, "error");
       }
     });
+  });
+
+  // Show/hide rather than re-render — a full re-render would remap each site's
+  // index and desync the location-picker map instances wired to edit-site-${i}.
+  content.querySelector("#site-search").addEventListener("input", (e) => {
+    const q = e.target.value.trim().toLowerCase();
+    let anyVisible = false;
+    sites.forEach((s, i) => {
+      const match =
+        !q ||
+        s.site_name.toLowerCase().includes(q) ||
+        s.client_name.toLowerCase().includes(q) ||
+        (s.address || "").toLowerCase().includes(q);
+      if (match) anyVisible = true;
+      const card = content.querySelector(`[data-idx="${i}"].list-card`);
+      if (card) card.style.display = match ? "" : "none";
+      if (!match) {
+        const detail = content.querySelector(`#detail-${i}`);
+        if (detail) detail.style.display = "none";
+      }
+    });
+    content.querySelector("#site-no-match").style.display = anyVisible || !sites.length ? "none" : "block";
   });
 }
 
@@ -1187,9 +1245,18 @@ async function renderAudit(content, nav) {
       <button class="icon-btn" id="back-btn">←</button>
       <h1 class="page-title">Audit Log</h1>
     </div>
-    ${logs
-      .map(
-        (l) => `
+    <input type="search" id="audit-search" placeholder="Search by action, entity, or user…" style="margin-bottom:0.75rem" />
+    <div id="audit-list"></div>
+  `;
+  content.querySelector("#back-btn").addEventListener("click", () => nav.back("more"));
+
+  const listEl = content.querySelector("#audit-list");
+  const searchEl = content.querySelector("#audit-search");
+  function renderList(items) {
+    listEl.innerHTML =
+      items
+        .map(
+          (l) => `
       <div class="list-card">
         <div class="list-card-body">
           <div class="list-card-title">${escapeHtml(l.action)} — ${escapeHtml(l.entity_type)}</div>
@@ -1198,10 +1265,23 @@ async function renderAudit(content, nav) {
         </div>
       </div>
     `
-      )
-      .join("") || '<div class="empty-state">No audit entries yet</div>'}
-  `;
-  content.querySelector("#back-btn").addEventListener("click", () => nav.back("more"));
+        )
+        .join("") ||
+      `<div class="empty-state">${logs.length ? "No entries match your search" : "No audit entries yet"}</div>`;
+  }
+  searchEl.addEventListener("input", () => {
+    const q = searchEl.value.trim().toLowerCase();
+    const filtered = q
+      ? logs.filter(
+          (l) =>
+            l.action.toLowerCase().includes(q) ||
+            l.entity_type.toLowerCase().includes(q) ||
+            l.user_name.toLowerCase().includes(q)
+        )
+      : logs;
+    renderList(filtered);
+  });
+  renderList(logs);
 }
 
 async function renderSettings(content, nav) {

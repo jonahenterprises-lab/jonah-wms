@@ -407,9 +407,10 @@ async function renderWorkers(content) {
             <label>Rate/door<input name="default_rate" type="number" step="0.01" value="${w.default_rate}" /></label>
             <button type="submit" class="pill-btn pill-btn-sm">Save</button>
           </form>
-          <div class="actions" style="display:flex;gap:0.5rem;margin-top:0.75rem">
+          <div class="actions" style="display:flex;gap:0.5rem;margin-top:0.75rem;flex-wrap:wrap">
             <button class="pill-btn outline pill-btn-sm" data-id="${w.id}" data-action="reset-pwd">Reset Password</button>
             <button class="pill-btn outline pill-btn-sm" data-id="${w.id}" data-status="${w.status}" data-action="toggle-status">${w.status === "Active" ? "Disable" : "Activate"}</button>
+            <button class="pill-btn outline pill-btn-sm" data-id="${w.id}" data-action="salary-slip">Salary Slip</button>
           </div>
         </div>
       `
@@ -444,6 +445,18 @@ async function renderWorkers(content) {
         } catch (err) {
           showMessage(content, err.message, "error");
           btn.disabled = false;
+        }
+      });
+    });
+    listEl.querySelectorAll('[data-action="salary-slip"]').forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const defaultMonth = new Date().toISOString().slice(0, 7);
+        const month = prompt("Month (YYYY-MM):", defaultMonth);
+        if (month === null) return;
+        try {
+          await downloadWithToken(`/salary-slip/${btn.dataset.id}?month=${encodeURIComponent(month)}`);
+        } catch (err) {
+          showMessage(content, err.message, "error");
         }
       });
     });

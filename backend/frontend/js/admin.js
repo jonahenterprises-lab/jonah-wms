@@ -597,8 +597,32 @@ function collectTargetDoors(form, idPrefix, doorTypes) {
   return targets;
 }
 
+function assignedWorkersHtml(idPrefix, workers, existingIds) {
+  if (!workers.length) return "";
+  return `
+    <label>Team (blank = open to every worker)</label>
+    <div class="card-block" style="padding:0.75rem">
+      ${workers
+        .map(
+          (w) => `
+        <label class="checklist-row">
+          <input type="checkbox" name="${idPrefix}-worker-${w.id}" ${existingIds.includes(w.id) ? "checked" : ""} />
+          <span>${escapeHtml(w.name)} <span class="list-card-meta">(${escapeHtml(w.employee_id)})</span></span>
+        </label>
+      `
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function collectAssignedWorkers(form, idPrefix, workers) {
+  return workers.filter((w) => form.querySelector(`[name="${idPrefix}-worker-${w.id}"]`)?.checked).map((w) => w.id);
+}
+
 async function renderSites(content) {
-  const [sites, doorTypes] = await Promise.all([get("/sites"), get("/door-types")]);
+  const [sites, doorTypes, workers] = await Promise.all([get("/sites"), get("/door-types"), get("/workers")]);
+  const workerName = (id) => workers.find((w) => w.id === id)?.name || "Unknown";
   content.innerHTML = `
     <div class="page-header-row">
       <h1 class="page-title">Sites</h1>
@@ -615,6 +639,7 @@ async function renderSites(content) {
         <label>Contact Number<input name="contact_number" /></label>
         ${doorRateOverridesHtml("add-site", doorTypes, {})}
         ${targetDoorsHtml("add-site", doorTypes, {})}
+        ${assignedWorkersHtml("add-site", workers, [])}
         <div class="error" id="add-error"></div>
         <button type="submit" class="pill-btn">Create Site</button>
       </form>
@@ -629,6 +654,11 @@ async function renderSites(content) {
             <div class="list-card-title">${escapeHtml(s.site_name)}</div>
             <div class="list-card-sub">${escapeHtml(s.client_name)}</div>
             <div class="list-card-meta">📍 ${escapeHtml(s.address)}</div>
+            <div class="list-card-meta">${
+              s.assigned_worker_ids && s.assigned_worker_ids.length
+                ? `👷 ${s.assigned_worker_ids.map(workerName).map(escapeHtml).join(", ")}`
+                : "👷 Open to every worker"
+            }</div>
           </div>
           <div class="list-card-right">${statusBadge(s.status)}</div>
         </button>
@@ -642,6 +672,7 @@ async function renderSites(content) {
             <label>Contact Number<input name="contact_number" value="${escapeHtml(s.contact_number || "")}" /></label>
             ${doorRateOverridesHtml(`edit-site-${i}`, doorTypes, s.door_type_rates || {})}
             ${targetDoorsHtml(`edit-site-${i}`, doorTypes, s.target_doors || {})}
+            ${assignedWorkersHtml(`edit-site-${i}`, workers, s.assigned_worker_ids || [])}
             <label>Status
               <select name="status">
                 <option ${s.status === "Active" ? "selected" : ""}>Active</option>
@@ -680,6 +711,7 @@ async function renderSites(content) {
         contact_number: fd.get("contact_number"),
         door_type_rates: collectDoorRateOverrides(e.target, "add-site", doorTypes),
         target_doors: collectTargetDoors(e.target, "add-site", doorTypes),
+        assigned_worker_ids: collectAssignedWorkers(e.target, "add-site", workers),
       });
       renderSites(content);
     } catch (err) {
@@ -715,6 +747,7 @@ async function renderSites(content) {
           status: fd.get("status"),
           door_type_rates: collectDoorRateOverrides(form, `edit-site-${form.dataset.idx}`, doorTypes),
           target_doors: collectTargetDoors(form, `edit-site-${form.dataset.idx}`, doorTypes),
+          assigned_worker_ids: collectAssignedWorkers(form, `edit-site-${form.dataset.idx}`, workers),
         });
         renderSites(content);
       } catch (err) {

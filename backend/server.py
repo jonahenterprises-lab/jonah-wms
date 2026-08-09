@@ -156,6 +156,7 @@ class SiteIn(BaseModel):
     notes: Optional[str] = ""
     door_type_rates: dict = {}  # {door_type_id: rate} — per-site override of a door type's default rate
     target_doors: dict = {}  # {door_type_id: assigned_count} — omitted key = no ceiling for that type
+    assigned_worker_ids: List[str] = []  # empty = open to every worker (unchanged legacy behavior)
 
 
 class DoorTypeIn(BaseModel):
@@ -544,6 +545,14 @@ async def list_sites(u=Depends(get_user), status_f: Optional[str] = Query(None, 
         q["status"] = status_f
     elif u["role"] == Role.worker.value:
         q["status"] = "Active"
+    if u["role"] == Role.worker.value:
+        # A site with no team set is open to everyone (legacy behavior for existing
+        # sites); once an admin picks a team, only those workers see/can check into it.
+        q["$or"] = [
+            {"assigned_worker_ids": {"$exists": False}},
+            {"assigned_worker_ids": {"$size": 0}},
+            {"assigned_worker_ids": u.get("worker_id")},
+        ]
     if u["role"] == Role.client.value:
         # Clients only ever see sites they're assigned to, regardless of ?status=
         q["id"] = {"$in": u.get("site_ids") or []}
@@ -732,6 +741,9 @@ async def check_in(body: CheckInIn, u=Depends(require_role(Role.worker, Role.adm
     site = await db.sites.find_one({"id": body.site_id}, {"_id": 0})
     if not site or site.get("status") != "Active":
         raise HTTPException(400, "Site is not active")
+    assigned = site.get("assigned_worker_ids") or []
+    if assigned and worker_id not in assigned:
+        raise HTTPException(403, "You are not assigned to this site.")
     geo_distance_m = None
     geo_warning = False
     if site.get("latitude") is not None and site.get("longitude") is not None:

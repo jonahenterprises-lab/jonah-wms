@@ -54,7 +54,13 @@ CORS_ORIGINS = [o.strip() for o in os.environ.get(
 # Obviously-fake demo workers/sites/reports — never seed these against a real deployment.
 SEED_DEMO_DATA = os.environ.get("SEED_DEMO_DATA", "true").lower() == "true"
 
-client = AsyncIOMotorClient(os.environ["MONGO_URL"], tlsCAFile=certifi.where())
+_mongo_url = os.environ["MONGO_URL"]
+# Passing tlsCAFile implicitly forces TLS in PyMongo even for a plain mongodb:// URL
+# with no tls param — fine (required, even) for Atlas's mongodb+srv:// URLs, but it
+# silently breaks a local/self-hosted mongod that isn't TLS-configured. Only apply it
+# for +srv connection strings, which is the standard hallmark of an Atlas connection.
+_mongo_kwargs = {"tlsCAFile": certifi.where()} if _mongo_url.startswith("mongodb+srv://") else {}
+client = AsyncIOMotorClient(_mongo_url, **_mongo_kwargs)
 db = client[os.environ["DB_NAME"]]
 
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -147,6 +153,13 @@ class SiteIn(BaseModel):
     contact_number: Optional[str] = ""
     status: str = "Active"
     notes: Optional[str] = ""
+    door_type_rates: dict = {}  # {door_type_id: rate} — per-site override of a door type's default rate
+
+
+class DoorTypeIn(BaseModel):
+    name: str
+    default_rate: float = Field(gt=0)
+    status: str = "Active"
 
 
 class CheckInIn(BaseModel):
@@ -166,10 +179,14 @@ class CheckOutIn(BaseModel):
     remarks: Optional[str] = ""
 
 
+class DoorLineItem(BaseModel):
+    door_type_id: str
+    count: int = Field(gt=0)
+
+
 class WorkReportIn(BaseModel):
     session_id: str
-    door_count: int = Field(ge=0)
-    rate_per_door: Optional[float] = None  # server may override
+    doors: List[DoorLineItem] = Field(min_length=1)  # one entry per door type installed
     notes: Optional[str] = ""
     work_completed: bool = True
     before_photos: List[str] = []  # base64 strings
@@ -257,10 +274,21 @@ def public_user(u: dict) -> UserOut:
     )
 
 
-async def get_effective_rate(worker_id: str, site_id: str) -> float:
+async def get_door_type_rate(door_type_id: str, site_id: str) -> tuple:
+    """Rate for a door type at a given site: site-specific override if set, else the
+    door type's own default_rate. Returns (name, rate)."""
+    door_type = await db.door_types.find_one({"id": door_type_id}, {"_id": 0})
+    if not door_type:
+        raise HTTPException(400, f"Unknown door type: {door_type_id}")
     site = await db.sites.find_one({"id": site_id}, {"_id": 0})
-    if site and site.get("rate_per_door"):
-        return float(site["rate_per_door"])
+    override = (site or {}).get("door_type_rates", {}).get(door_type_id)
+    rate = float(override) if override is not None else float(door_type["default_rate"])
+    return door_type["name"], rate
+
+
+async def get_effective_rate(worker_id: str, site_id: str) -> float:
+    """Legacy flat-rate fallback — used only where no door type applies (e.g. admin
+    manually editing a report's total at approval time without changing its breakdown)."""
     worker = await db.workers.find_one({"id": worker_id}, {"_id": 0})
     if worker and worker.get("default_rate"):
         return float(worker["default_rate"])
@@ -508,6 +536,38 @@ async def delete_site(site_id: str, u=Depends(require_role(Role.admin))):
     return {"ok": True}
 
 
+# --- Door Types ------------------------------------------------------------
+@api.get("/door-types")
+async def list_door_types(u=Depends(get_user), status_f: Optional[str] = Query(None, alias="status")):
+    q = {}
+    if status_f:
+        q["status"] = status_f
+    elif u["role"] == Role.worker.value:
+        q["status"] = "Active"  # workers only pick from active types when submitting reports
+    return await db.door_types.find(q, {"_id": 0}).sort("name", 1).to_list(200)
+
+
+@api.post("/door-types")
+async def create_door_type(body: DoorTypeIn, u=Depends(require_role(Role.admin))):
+    doc = body.dict()
+    doc["id"] = str(uuid.uuid4())
+    doc["created_at"] = now_utc().isoformat()
+    await db.door_types.insert_one(doc.copy())
+    await audit(u, "create", "door_type", doc["id"], None, doc)
+    return clean(doc)
+
+
+@api.put("/door-types/{door_type_id}")
+async def update_door_type(door_type_id: str, body: DoorTypeIn, u=Depends(require_role(Role.admin))):
+    old = await db.door_types.find_one({"id": door_type_id}, {"_id": 0})
+    if not old:
+        raise HTTPException(404, "Door type not found")
+    upd = body.dict()
+    await db.door_types.update_one({"id": door_type_id}, {"$set": upd})
+    await audit(u, "update", "door_type", door_type_id, old, upd)
+    return {**old, **upd}
+
+
 # --- Workers -------------------------------------------------------------
 @api.get("/workers")
 async def list_workers(u=Depends(require_role(Role.admin))):
@@ -707,9 +767,23 @@ async def create_report(body: WorkReportIn, u=Depends(require_role(Role.worker, 
         raise HTTPException(400, "At least 1 before and 1 after photo required")
     if any(_photo_too_large(p) for p in body.before_photos + body.after_photos):
         raise HTTPException(400, "One or more photos exceed the size limit (~9MB each)")
-    # server-computed rate & total (never trust client)
-    rate = await get_effective_rate(sess["worker_id"], sess["site_id"])
-    total = round(body.door_count * rate, 2)
+    # server-computed breakdown & total (never trust client-supplied rates)
+    door_breakdown = []
+    door_count = 0
+    total = 0.0
+    for item in body.doors:
+        name, rate = await get_door_type_rate(item.door_type_id, sess["site_id"])
+        subtotal = round(item.count * rate, 2)
+        door_breakdown.append({
+            "door_type_id": item.door_type_id,
+            "door_type_name": name,
+            "rate": rate,
+            "count": item.count,
+            "subtotal": subtotal,
+        })
+        door_count += item.count
+        total += subtotal
+    total = round(total, 2)
     # Watermark all photos server-side
     lat_ci = sess.get("check_in_latitude")
     lng_ci = sess.get("check_in_longitude")
@@ -724,8 +798,9 @@ async def create_report(body: WorkReportIn, u=Depends(require_role(Role.worker, 
         "site_id": sess["site_id"],
         "site_name": sess.get("site_name"),
         "work_date": now_utc().date().isoformat(),
-        "door_count": body.door_count,
-        "rate_per_door": rate,
+        "door_count": door_count,
+        "rate_per_door": round(total / door_count, 2) if door_count else 0,
+        "door_breakdown": door_breakdown,
         "total_amount": total,
         "notes": body.notes or "",
         "work_completed": body.work_completed,
@@ -742,7 +817,7 @@ async def create_report(body: WorkReportIn, u=Depends(require_role(Role.worker, 
         doc["client_sync_id"] = body.client_sync_id
     await db.work_reports.insert_one(doc.copy())
     async for admin in db.users.find({"role": Role.admin.value}, {"_id": 0, "id": 1}):
-        await add_notification(admin["id"], "New Work Report", f"{sess.get('worker_name')} submitted a report ({body.door_count} doors).")
+        await add_notification(admin["id"], "New Work Report", f"{sess.get('worker_name')} submitted a report ({door_count} doors).")
     return clean(doc)
 
 
@@ -2030,6 +2105,18 @@ async def startup():
             "currency": "₹",
             "default_rate": 250.0,
         })
+
+    # seed a default door type — required config, not demo clutter: without at
+    # least one, workers can't submit any report at all (min_length=1 on doors[]).
+    if await db.door_types.count_documents({}) == 0:
+        await db.door_types.insert_one({
+            "id": str(uuid.uuid4()),
+            "name": "Standard Door",
+            "default_rate": 250.0,
+            "status": "Active",
+            "created_at": now_utc().isoformat(),
+        })
+        logger.info("Seeded default door type: Standard Door @ 250.0")
 
     # seed admin — bootstrap account needed to log in at all. Never a hardcoded
     # password: use ADMIN_INITIAL_PASSWORD if provided, otherwise generate a

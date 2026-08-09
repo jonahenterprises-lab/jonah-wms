@@ -91,6 +91,7 @@ export function renderWorker(frame, user, logout) {
     profile: renderProfile,
     leave: renderLeave,
     reportform: renderReportForm,
+    changepwd: renderChangePassword,
   };
 
   function render() {
@@ -303,6 +304,7 @@ async function renderSites(content, user, nav) {
 
 async function renderReportForm(content, user, nav, logout, params) {
   const session = params.session;
+  const doorTypes = await get("/door-types"); // Active only, per backend filtering for Worker role
   content.innerHTML = `
     <div class="back-row">
       <button class="icon-btn" id="back-btn">←</button>
@@ -311,8 +313,21 @@ async function renderReportForm(content, user, nav, logout, params) {
     <p class="page-subtitle">${escapeHtml(session.site_name)} — ${formatDateTime(session.check_in_time)}</p>
 
     <form id="report-form">
-      <label for="report-doors">Doors installed</label>
-      <input type="number" id="report-doors" min="0" required />
+      <label>Doors installed, by type</label>
+      ${
+        doorTypes.length === 0
+          ? '<p class="error">No door types configured — ask your admin to add one before submitting a report.</p>'
+          : doorTypes
+              .map(
+                (t) => `
+        <div style="display:flex;align-items:center;gap:0.6rem;margin-bottom:0.6rem">
+          <span style="flex:1">${escapeHtml(t.name)}</span>
+          <input type="number" min="0" step="1" value="0" style="width:90px" class="door-type-count" data-id="${t.id}" data-name="${escapeHtml(t.name)}" />
+        </div>
+      `
+              )
+              .join("")
+      }
 
       <label class="checkbox-label"><input type="checkbox" id="report-completed" checked /> Work completed</label>
 
@@ -351,6 +366,13 @@ async function renderReportForm(content, user, nav, logout, params) {
       errorEl.textContent = "At least 1 before and 1 after photo required";
       return;
     }
+    const doors = Array.from(content.querySelectorAll(".door-type-count"))
+      .map((inp) => ({ door_type_id: inp.dataset.id, count: Number(inp.value) || 0 }))
+      .filter((d) => d.count > 0);
+    if (!doors.length) {
+      errorEl.textContent = "Enter a count for at least one door type";
+      return;
+    }
     btn.disabled = true;
     btn.textContent = "Uploading…";
     try {
@@ -360,7 +382,7 @@ async function renderReportForm(content, user, nav, logout, params) {
       const afterPhotos = await filesToDataUris(afterInput.files);
       await post("/work-reports", {
         session_id: session.id,
-        door_count: Number(content.querySelector("#report-doors").value),
+        doors,
         work_completed: content.querySelector("#report-completed").checked,
         notes: content.querySelector("#report-notes").value,
         before_photos: beforePhotos,
@@ -401,6 +423,11 @@ async function renderReports(content, user) {
             <div><div class="stat-tile-label">Rate</div><div class="list-card-title">${money(r.rate_per_door)}</div></div>
             <div><div class="stat-tile-label">Total</div><div class="list-card-amount">${money(r.total_amount)}</div></div>
           </div>
+          ${
+            r.door_breakdown && r.door_breakdown.length
+              ? `<div class="list-card-meta">${r.door_breakdown.map((d) => `${escapeHtml(d.door_type_name)} × ${d.count}`).join(", ")}</div>`
+              : ""
+          }
           ${r.notes ? `<div class="list-card-meta">Note: ${escapeHtml(r.notes)}</div>` : ""}
           ${r.approval_remarks ? `<div class="list-card-meta">Remarks: ${escapeHtml(r.approval_remarks)}</div>` : ""}
           <button class="btn-link" data-idx="${i}" style="align-self:flex-start;margin-top:0.4rem">View Photos</button>
@@ -514,6 +541,14 @@ async function renderProfile(content, user, nav, logout) {
       <div>›</div>
     </button>
 
+    <button class="list-card" id="change-pwd-link" style="width:100%;text-align:left;border:1px solid var(--border);cursor:pointer">
+      <div class="list-card-body">
+        <div class="list-card-title">Change Password</div>
+        <div class="list-card-sub">Update your login password</div>
+      </div>
+      <div>›</div>
+    </button>
+
     <div class="section-label">Notifications</div>
     <div id="notif-list">
       ${
@@ -536,7 +571,54 @@ async function renderProfile(content, user, nav, logout) {
     <button class="pill-btn outline" id="logout-btn" style="margin-top:1rem">Logout</button>
   `;
   content.querySelector("#leave-link").addEventListener("click", () => nav.pushView("leave"));
+  content.querySelector("#change-pwd-link").addEventListener("click", () => nav.pushView("changepwd"));
   content.querySelector("#logout-btn").addEventListener("click", logout);
+}
+
+async function renderChangePassword(content, user, nav, logout) {
+  content.innerHTML = `
+    <div class="back-row">
+      <button class="icon-btn" id="back-btn">←</button>
+      <h1 class="page-title">Change Password</h1>
+    </div>
+    <form class="card-block" id="pwd-form">
+      <label for="pwd-current">Current password</label>
+      <input type="password" id="pwd-current" autocomplete="current-password" required />
+      <label for="pwd-new">New password</label>
+      <input type="password" id="pwd-new" autocomplete="new-password" required minlength="8" />
+      <label for="pwd-confirm">Confirm new password</label>
+      <input type="password" id="pwd-confirm" autocomplete="new-password" required minlength="8" />
+      <div class="error" id="pwd-error"></div>
+      <button type="submit" class="pill-btn">Update Password</button>
+    </form>
+  `;
+  content.querySelector("#back-btn").addEventListener("click", () => nav.goTab("profile"));
+  content.querySelector("#pwd-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const errorEl = content.querySelector("#pwd-error");
+    errorEl.textContent = "";
+    const current = content.querySelector("#pwd-current").value;
+    const next = content.querySelector("#pwd-new").value;
+    const confirm = content.querySelector("#pwd-confirm").value;
+    if (next !== confirm) {
+      errorEl.textContent = "New passwords don't match";
+      return;
+    }
+    const btn = e.target.querySelector("button[type=submit]");
+    btn.disabled = true;
+    btn.textContent = "Updating…";
+    try {
+      await post("/auth/change-password", { current_password: current, new_password: next });
+      // Changing the password invalidates the current session token server-side,
+      // so the next authenticated request would 401 anyway — log out cleanly instead.
+      alert("Password updated. Please log in again with your new password.");
+      logout();
+    } catch (err) {
+      errorEl.textContent = err.message;
+      btn.disabled = false;
+      btn.textContent = "Update Password";
+    }
+  });
 }
 
 async function renderLeave(content, user, nav) {

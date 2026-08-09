@@ -48,7 +48,9 @@ const MORE_TILES = [
   { key: "attendance", icon: "🗺️", label: "Attendance & Map" },
   { key: "reports", icon: "⬇️", label: "Reports & Export" },
   { key: "audit", icon: "🛡️", label: "Audit Log" },
+  { key: "doortypes", icon: "🚪", label: "Door Types" },
   { key: "settings", icon: "⚙️", label: "Settings" },
+  { key: "changepwd", icon: "🔑", label: "Change Password" },
 ];
 
 async function downloadWithToken(path) {
@@ -99,7 +101,9 @@ export function renderAdmin(frame, user, logout) {
     attendance: renderAttendance,
     reports: renderReportsExport,
     audit: renderAudit,
+    doortypes: renderDoorTypes,
     settings: renderSettings,
+    changepwd: renderChangePassword,
   };
 
   function render() {
@@ -261,6 +265,11 @@ async function renderApprovals(content) {
           <span>${r.door_count} doors</span>
           <span class="list-card-amount">${money(r.total_amount)}</span>
         </div>
+        ${
+          r.door_breakdown && r.door_breakdown.length
+            ? `<div class="list-card-meta">${r.door_breakdown.map((d) => `${escapeHtml(d.door_type_name)} × ${d.count}`).join(", ")}</div>`
+            : ""
+        }
         <button class="btn-link" data-idx="${i}" data-action="photos" style="align-self:flex-start">Photos</button>
         <div class="photo-strip" id="photos-${i}" style="display:none">
           ${r.before_photos.map((p) => `<img src="${p}" alt="before" />`).join("")}
@@ -486,8 +495,37 @@ function wireLocationPicker(content, idPrefix, initialLat, initialLng) {
   return ensureInit;
 }
 
+function doorRateOverridesHtml(idPrefix, doorTypes, existingRates) {
+  if (!doorTypes.length) return "";
+  return `
+    <label>Door Type Rate Overrides (blank = use default)</label>
+    <div class="card-block" style="padding:0.75rem">
+      ${doorTypes
+        .map(
+          (t) => `
+        <div style="display:flex;align-items:center;gap:0.6rem;margin-bottom:0.5rem">
+          <span style="flex:1;font-size:0.85rem">${escapeHtml(t.name)} <span class="list-card-meta">(default ${money(t.default_rate)})</span></span>
+          <input type="number" step="0.01" min="0" style="width:110px" name="${idPrefix}-rate-${t.id}"
+            value="${existingRates[t.id] ?? ""}" placeholder="${t.default_rate}" />
+        </div>
+      `
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function collectDoorRateOverrides(form, idPrefix, doorTypes) {
+  const rates = {};
+  doorTypes.forEach((t) => {
+    const input = form.querySelector(`[name="${idPrefix}-rate-${t.id}"]`);
+    if (input && input.value !== "") rates[t.id] = Number(input.value);
+  });
+  return rates;
+}
+
 async function renderSites(content) {
-  const sites = await get("/sites");
+  const [sites, doorTypes] = await Promise.all([get("/sites"), get("/door-types")]);
   content.innerHTML = `
     <div class="page-header-row">
       <h1 class="page-title">Sites</h1>
@@ -501,6 +539,7 @@ async function renderSites(content) {
         ${locationPickerHtml("add-site", null, null)}
         <label>Contact Person<input name="contact_person" /></label>
         <label>Contact Number<input name="contact_number" /></label>
+        ${doorRateOverridesHtml("add-site", doorTypes, {})}
         <div class="error" id="add-error"></div>
         <button type="submit" class="pill-btn">Create Site</button>
       </form>
@@ -518,13 +557,14 @@ async function renderSites(content) {
           <div class="list-card-right">${statusBadge(s.status)}</div>
         </button>
         <div class="card-block" id="detail-${i}" style="display:none">
-          <form class="edit-form" data-id="${s.id}">
+          <form class="edit-form" data-id="${s.id}" data-idx="${i}">
             <label>Site Name<input name="site_name" value="${escapeHtml(s.site_name)}" required /></label>
             <label>Client Name<input name="client_name" value="${escapeHtml(s.client_name)}" required /></label>
             <label>Address<input name="address" value="${escapeHtml(s.address)}" required /></label>
             ${locationPickerHtml(`edit-site-${i}`, s.latitude, s.longitude)}
             <label>Contact Person<input name="contact_person" value="${escapeHtml(s.contact_person || "")}" /></label>
             <label>Contact Number<input name="contact_number" value="${escapeHtml(s.contact_number || "")}" /></label>
+            ${doorRateOverridesHtml(`edit-site-${i}`, doorTypes, s.door_type_rates || {})}
             <label>Status
               <select name="status">
                 <option ${s.status === "Active" ? "selected" : ""}>Active</option>
@@ -561,6 +601,7 @@ async function renderSites(content) {
         longitude: fd.get("longitude") ? Number(fd.get("longitude")) : null,
         contact_person: fd.get("contact_person"),
         contact_number: fd.get("contact_number"),
+        door_type_rates: collectDoorRateOverrides(e.target, "add-site", doorTypes),
       });
       renderSites(content);
     } catch (err) {
@@ -594,6 +635,7 @@ async function renderSites(content) {
           contact_person: fd.get("contact_person"),
           contact_number: fd.get("contact_number"),
           status: fd.get("status"),
+          door_type_rates: collectDoorRateOverrides(form, `edit-site-${form.dataset.idx}`, doorTypes),
         });
         renderSites(content);
       } catch (err) {
@@ -1036,5 +1078,138 @@ async function renderSettings(content, nav) {
     } catch (err) {
       errorEl.textContent = err.message;
     }
+  });
+}
+
+async function renderChangePassword(content, nav, logout) {
+  content.innerHTML = `
+    <div class="back-row">
+      <button class="icon-btn" id="back-btn">←</button>
+      <h1 class="page-title">Change Password</h1>
+    </div>
+    <form class="card-block" id="pwd-form">
+      <label for="pwd-current">Current password</label>
+      <input type="password" id="pwd-current" autocomplete="current-password" required />
+      <label for="pwd-new">New password</label>
+      <input type="password" id="pwd-new" autocomplete="new-password" required minlength="8" />
+      <label for="pwd-confirm">Confirm new password</label>
+      <input type="password" id="pwd-confirm" autocomplete="new-password" required minlength="8" />
+      <div class="error" id="pwd-error"></div>
+      <button type="submit" class="pill-btn">Update Password</button>
+    </form>
+  `;
+  content.querySelector("#back-btn").addEventListener("click", () => nav.back("more"));
+  content.querySelector("#pwd-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const errorEl = content.querySelector("#pwd-error");
+    errorEl.textContent = "";
+    const current = content.querySelector("#pwd-current").value;
+    const next = content.querySelector("#pwd-new").value;
+    const confirm = content.querySelector("#pwd-confirm").value;
+    if (next !== confirm) {
+      errorEl.textContent = "New passwords don't match";
+      return;
+    }
+    const btn = e.target.querySelector("button[type=submit]");
+    btn.disabled = true;
+    btn.textContent = "Updating…";
+    try {
+      await post("/auth/change-password", { current_password: current, new_password: next });
+      alert("Password updated. Please log in again with your new password.");
+      logout();
+    } catch (err) {
+      errorEl.textContent = err.message;
+      btn.disabled = false;
+      btn.textContent = "Update Password";
+    }
+  });
+}
+
+async function renderDoorTypes(content, nav) {
+  const types = await get("/door-types");
+  content.innerHTML = `
+    <div class="back-row">
+      <button class="icon-btn" id="back-btn">←</button>
+      <h1 class="page-title" style="flex:1">Door Types</h1>
+      <button class="fab" id="add-btn">+</button>
+    </div>
+    <p class="page-subtitle">Base rate per door type — sites can override these individually</p>
+    <div id="add-form-wrap" style="display:none" class="card-block">
+      <form id="add-form">
+        <label>Name<input name="name" placeholder="e.g. Steel Door" required /></label>
+        <label>Rate per door<input name="default_rate" type="number" step="0.01" min="0.01" required /></label>
+        <div class="error" id="add-error"></div>
+        <button type="submit" class="pill-btn">Create Door Type</button>
+      </form>
+    </div>
+    <div id="type-list">
+      ${types
+        .map(
+          (t, i) => `
+        <button class="list-card" data-idx="${i}" style="width:100%;text-align:left;border:1px solid var(--border);cursor:pointer">
+          <div class="list-card-body">
+            <div class="list-card-title">${escapeHtml(t.name)}</div>
+          </div>
+          <div class="list-card-right">
+            <div class="list-card-amount">${money(t.default_rate)}</div>
+            ${statusBadge(t.status)}
+          </div>
+        </button>
+        <div class="card-block" id="detail-${i}" style="display:none">
+          <form class="edit-form" data-id="${t.id}">
+            <label>Name<input name="name" value="${escapeHtml(t.name)}" required /></label>
+            <label>Rate per door<input name="default_rate" type="number" step="0.01" min="0.01" value="${t.default_rate}" required /></label>
+            <label>Status
+              <select name="status">
+                <option ${t.status === "Active" ? "selected" : ""}>Active</option>
+                <option ${t.status === "Disabled" ? "selected" : ""}>Disabled</option>
+              </select>
+            </label>
+            <button type="submit" class="pill-btn pill-btn-sm">Save</button>
+          </form>
+        </div>
+      `
+        )
+        .join("") || '<div class="empty-state"><div class="title">No door types yet</div></div>'}
+    </div>
+  `;
+  content.querySelector("#back-btn").addEventListener("click", () => nav.back("more"));
+  content.querySelector("#add-btn").addEventListener("click", () => {
+    const wrap = content.querySelector("#add-form-wrap");
+    wrap.style.display = wrap.style.display === "none" ? "block" : "none";
+  });
+  content.querySelector("#add-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const errorEl = content.querySelector("#add-error");
+    errorEl.textContent = "";
+    const fd = new FormData(e.target);
+    try {
+      await post("/door-types", { name: fd.get("name"), default_rate: Number(fd.get("default_rate")) });
+      renderDoorTypes(content, nav);
+    } catch (err) {
+      errorEl.textContent = err.message;
+    }
+  });
+  content.querySelectorAll("[data-idx]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const d = content.querySelector(`#detail-${btn.dataset.idx}`);
+      d.style.display = d.style.display === "none" ? "block" : "none";
+    });
+  });
+  content.querySelectorAll(".edit-form").forEach((form) => {
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const fd = new FormData(form);
+      try {
+        await put(`/door-types/${form.dataset.id}`, {
+          name: fd.get("name"),
+          default_rate: Number(fd.get("default_rate")),
+          status: fd.get("status"),
+        });
+        renderDoorTypes(content, nav);
+      } catch (err) {
+        showMessage(content, err.message, "error");
+      }
+    });
   });
 }

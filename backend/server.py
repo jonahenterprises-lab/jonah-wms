@@ -15,6 +15,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Annotated, List, Optional
 
+import certifi
 import httpx
 import jwt
 from dotenv import load_dotenv
@@ -53,7 +54,7 @@ CORS_ORIGINS = [o.strip() for o in os.environ.get(
 # Obviously-fake demo workers/sites/reports — never seed these against a real deployment.
 SEED_DEMO_DATA = os.environ.get("SEED_DEMO_DATA", "true").lower() == "true"
 
-client = AsyncIOMotorClient(os.environ["MONGO_URL"])
+client = AsyncIOMotorClient(os.environ["MONGO_URL"], tlsCAFile=certifi.where())
 db = client[os.environ["DB_NAME"]]
 
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")

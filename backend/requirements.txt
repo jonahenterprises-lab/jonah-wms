@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 motor
 pymongo
+certifi
 python-dotenv
 pyjwt
 passlib[bcrypt]

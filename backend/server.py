@@ -1425,6 +1425,46 @@ async def create_invoice(body: InvoiceIn, u=Depends(require_role(Role.admin))):
     return clean(doc)
 
 
+@api.put("/invoices/{iid}")
+async def update_invoice(iid: str, body: InvoiceIn, u=Depends(require_role(Role.admin))):
+    old = await db.invoices.find_one({"id": iid}, {"_id": 0})
+    if not old:
+        raise HTTPException(404, "Not found")
+    if not body.items:
+        raise HTTPException(400, "At least one line item required")
+    # totals are always server-recomputed from the edited line items, never trusted from the client
+    subtotal = round(sum(it.quantity * it.unit_price for it in body.items), 2)
+    gst_amount = round(subtotal * (body.gst_rate / 100.0), 2)
+    total = round(subtotal + gst_amount, 2)
+    upd = {
+        "site_id": body.site_id,
+        "client_name": body.client_name,
+        "client_gstin": body.client_gstin or "",
+        "client_address": body.client_address or "",
+        "invoice_date": body.invoice_date or old["invoice_date"],
+        "due_date": body.due_date or "",
+        "items": [it.dict() for it in body.items],
+        "subtotal": subtotal,
+        "gst_rate": body.gst_rate,
+        "gst_amount": gst_amount,
+        "total": total,
+        "notes": body.notes or "",
+    }
+    await db.invoices.update_one({"id": iid}, {"$set": upd})
+    await audit(u, "update", "invoice", iid, old, upd)
+    return {**old, **upd}
+
+
+@api.delete("/invoices/{iid}")
+async def delete_invoice(iid: str, u=Depends(require_role(Role.admin))):
+    old = await db.invoices.find_one({"id": iid}, {"_id": 0})
+    if not old:
+        raise HTTPException(404, "Not found")
+    await db.invoices.delete_one({"id": iid})
+    await audit(u, "delete", "invoice", iid, old, None)
+    return {"ok": True}
+
+
 @api.get("/invoices")
 async def list_invoices(u=Depends(require_role(Role.admin, Role.client))):
     q = {}

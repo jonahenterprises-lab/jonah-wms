@@ -750,7 +750,46 @@ async function renderPayout(content, nav) {
   });
 }
 
+function addInvoiceItemRow(itemsWrap, item) {
+  const row = document.createElement("div");
+  row.className = "card-block item-row";
+  row.style.position = "relative";
+  row.innerHTML = `
+    <label>Description<input name="description" value="${escapeHtml(item?.description || "")}" required /></label>
+    <label>Quantity<input name="quantity" type="number" step="1" value="${item?.quantity ?? 1}" required /></label>
+    <label>Unit Price<input name="unit_price" type="number" step="0.01" value="${item?.unit_price ?? ""}" required /></label>
+    <label>HSN Code<input name="hsn_code" value="${escapeHtml(item?.hsn_code || "")}" /></label>
+    <button type="button" class="btn-link text-danger remove-item-btn">Remove</button>
+  `;
+  row.querySelector(".remove-item-btn").addEventListener("click", () => {
+    if (itemsWrap.querySelectorAll(".item-row").length > 1) row.remove();
+    else alert("An invoice needs at least one line item");
+  });
+  itemsWrap.appendChild(row);
+}
+
+function collectInvoiceItems(itemsWrap) {
+  return Array.from(itemsWrap.querySelectorAll(".item-row")).map((row) => ({
+    description: row.querySelector('[name="description"]').value,
+    quantity: Number(row.querySelector('[name="quantity"]').value),
+    unit_price: Number(row.querySelector('[name="unit_price"]').value),
+    hsn_code: row.querySelector('[name="hsn_code"]').value,
+  }));
+}
+
+function invoiceFormHtml(idPrefix, inv) {
+  return `
+    <label>Client Name<input name="client_name" value="${escapeHtml(inv?.client_name || "")}" required /></label>
+    <label>Client GSTIN<input name="client_gstin" value="${escapeHtml(inv?.client_gstin || "")}" /></label>
+    <label>Client Address<input name="client_address" value="${escapeHtml(inv?.client_address || "")}" /></label>
+    <label>GST Rate %<input name="gst_rate" type="number" step="0.1" value="${inv?.gst_rate ?? 18}" /></label>
+    <div id="${idPrefix}-items"></div>
+    <button type="button" class="btn-link" id="${idPrefix}-add-item">+ Add line item</button>
+  `;
+}
+
 async function renderInvoices(content, nav) {
+  const invoices = await get("/invoices");
   content.innerHTML = `
     <div class="back-row">
       <button class="icon-btn" id="back-btn">←</button>
@@ -759,34 +798,49 @@ async function renderInvoices(content, nav) {
     </div>
     <div id="invoice-form-wrap" style="display:none" class="card-block">
       <form id="invoice-form">
-        <label>Client Name<input name="client_name" required /></label>
-        <label>Client GSTIN<input name="client_gstin" /></label>
-        <label>Client Address<input name="client_address" /></label>
-        <label>GST Rate %<input name="gst_rate" type="number" step="0.1" value="18" /></label>
-        <div id="items"></div>
-        <button type="button" class="btn-link" id="add-item">+ Add line item</button>
+        ${invoiceFormHtml("new", null)}
         <div class="error" id="invoice-error"></div>
         <button type="submit" class="pill-btn" style="margin-top:0.75rem">Create Invoice</button>
       </form>
     </div>
-    <div id="invoice-list"></div>
+    <div id="invoice-list">
+      ${
+        invoices
+          .map(
+            (inv, i) => `
+        <div class="list-card" style="flex-direction:column;align-items:stretch">
+          <div style="display:flex;justify-content:space-between">
+            <div class="list-card-body">
+              <div class="list-card-title">${escapeHtml(inv.invoice_number)}</div>
+              <div class="list-card-sub">${escapeHtml(inv.client_name)} · ${escapeHtml(inv.invoice_date)}</div>
+            </div>
+            <div class="list-card-amount">${money(inv.total)}</div>
+          </div>
+          <div class="actions" style="display:flex;gap:0.5rem;margin-top:0.5rem">
+            <button class="pill-btn outline pill-btn-sm" data-idx="${i}" data-action="pdf">Download PDF</button>
+            <button class="pill-btn outline pill-btn-sm" data-idx="${i}" data-action="edit">Edit</button>
+            <button class="pill-btn outline pill-btn-sm text-danger" data-idx="${i}" data-action="delete">Delete</button>
+          </div>
+        </div>
+        <div class="card-block" id="inv-detail-${i}" style="display:none">
+          <form class="invoice-edit-form" data-id="${inv.id}" data-idx="${i}">
+            ${invoiceFormHtml(`edit-inv-${i}`, inv)}
+            <div class="error" id="edit-inv-${i}-error"></div>
+            <button type="submit" class="pill-btn pill-btn-sm" style="margin-top:0.75rem">Save Changes</button>
+          </form>
+        </div>
+      `
+          )
+          .join("") || '<div class="empty-state"><div class="title">No invoices yet</div></div>'
+      }
+    </div>
   `;
   content.querySelector("#back-btn").addEventListener("click", () => nav.back("more"));
 
-  const itemsWrap = content.querySelector("#items");
-  function addItemRow() {
-    const row = document.createElement("div");
-    row.className = "card-block item-row";
-    row.innerHTML = `
-      <label>Description<input name="description" required /></label>
-      <label>Quantity<input name="quantity" type="number" step="1" value="1" required /></label>
-      <label>Unit Price<input name="unit_price" type="number" step="0.01" required /></label>
-      <label>HSN Code<input name="hsn_code" /></label>
-    `;
-    itemsWrap.appendChild(row);
-  }
-  addItemRow();
-  content.querySelector("#add-item").addEventListener("click", addItemRow);
+  // --- Create form ---
+  const newItemsWrap = content.querySelector("#new-items");
+  addInvoiceItemRow(newItemsWrap, null);
+  content.querySelector("#new-add-item").addEventListener("click", () => addInvoiceItemRow(newItemsWrap, null));
 
   const formWrap = content.querySelector("#invoice-form-wrap");
   content.querySelector("#add-btn").addEventListener("click", () => {
@@ -798,19 +852,13 @@ async function renderInvoices(content, nav) {
     const errorEl = content.querySelector("#invoice-error");
     errorEl.textContent = "";
     const fd = new FormData(e.target);
-    const items = Array.from(itemsWrap.querySelectorAll(".item-row")).map((row) => ({
-      description: row.querySelector('[name="description"]').value,
-      quantity: Number(row.querySelector('[name="quantity"]').value),
-      unit_price: Number(row.querySelector('[name="unit_price"]').value),
-      hsn_code: row.querySelector('[name="hsn_code"]').value,
-    }));
     try {
       await post("/invoices", {
         client_name: fd.get("client_name"),
         client_gstin: fd.get("client_gstin"),
         client_address: fd.get("client_address"),
         gst_rate: Number(fd.get("gst_rate")),
-        items,
+        items: collectInvoiceItems(newItemsWrap),
       });
       renderInvoices(content, nav);
     } catch (err) {
@@ -818,27 +866,59 @@ async function renderInvoices(content, nav) {
     }
   });
 
-  const invoices = await get("/invoices");
-  const listEl = content.querySelector("#invoice-list");
-  listEl.innerHTML =
-    invoices
-      .map(
-        (inv, i) => `
-    <div class="list-card" style="flex-direction:column;align-items:stretch">
-      <div style="display:flex;justify-content:space-between">
-        <div class="list-card-body">
-          <div class="list-card-title">${escapeHtml(inv.invoice_number)}</div>
-          <div class="list-card-sub">${escapeHtml(inv.client_name)} · ${escapeHtml(inv.invoice_date)}</div>
-        </div>
-        <div class="list-card-amount">${money(inv.total)}</div>
-      </div>
-      <button class="pill-btn outline pill-btn-sm" data-idx="${i}" style="align-self:flex-start;margin-top:0.5rem">Download PDF</button>
-    </div>
-  `
-      )
-      .join("") || '<div class="empty-state"><div class="title">No invoices yet</div></div>';
-  listEl.querySelectorAll("[data-idx]").forEach((btn) => {
+  // --- Per-invoice edit forms (lazy-initialize item rows only when opened) ---
+  const editItemsInitialized = {};
+  function ensureEditItems(i) {
+    if (editItemsInitialized[i]) return;
+    const wrap = content.querySelector(`#edit-inv-${i}-items`);
+    invoices[i].items.forEach((item) => addInvoiceItemRow(wrap, item));
+    content.querySelector(`#edit-inv-${i}-add-item`).addEventListener("click", () => addInvoiceItemRow(wrap, null));
+    editItemsInitialized[i] = true;
+  }
+
+  content.querySelectorAll('[data-action="pdf"]').forEach((btn) => {
     btn.addEventListener("click", () => downloadWithToken(`/invoices/${invoices[Number(btn.dataset.idx)].id}/pdf`));
+  });
+  content.querySelectorAll('[data-action="edit"]').forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const idx = Number(btn.dataset.idx);
+      ensureEditItems(idx);
+      const d = content.querySelector(`#inv-detail-${idx}`);
+      d.style.display = d.style.display === "none" ? "block" : "none";
+    });
+  });
+  content.querySelectorAll('[data-action="delete"]').forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const inv = invoices[Number(btn.dataset.idx)];
+      if (!confirm(`Delete invoice ${inv.invoice_number}? This cannot be undone.`)) return;
+      try {
+        await del(`/invoices/${inv.id}`);
+        renderInvoices(content, nav);
+      } catch (err) {
+        showMessage(content, err.message, "error");
+      }
+    });
+  });
+  content.querySelectorAll(".invoice-edit-form").forEach((form) => {
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const idx = form.dataset.idx;
+      const errorEl = content.querySelector(`#edit-inv-${idx}-error`);
+      errorEl.textContent = "";
+      const fd = new FormData(form);
+      try {
+        await put(`/invoices/${form.dataset.id}`, {
+          client_name: fd.get("client_name"),
+          client_gstin: fd.get("client_gstin"),
+          client_address: fd.get("client_address"),
+          gst_rate: Number(fd.get("gst_rate")),
+          items: collectInvoiceItems(content.querySelector(`#edit-inv-${idx}-items`)),
+        });
+        renderInvoices(content, nav);
+      } catch (err) {
+        errorEl.textContent = err.message;
+      }
+    });
   });
 }
 

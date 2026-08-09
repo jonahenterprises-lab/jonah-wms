@@ -50,7 +50,7 @@ function logout() {
 function renderShell(user) {
   root.innerHTML = "";
   const shell = document.createElement("div");
-  shell.className = "shell";
+  shell.className = "shell" + (user.role === "Admin" ? " role-admin" : "");
   const frame = document.createElement("div");
   frame.className = "app-frame";
   shell.appendChild(frame);

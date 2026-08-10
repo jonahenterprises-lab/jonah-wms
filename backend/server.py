@@ -2158,12 +2158,6 @@ async def excel_oauth_start(u=Depends(require_role(Role.admin))):
         "response_mode": "query",
         "scope": "offline_access Files.ReadWrite",
         "state": state,
-        # Forces Microsoft to treat this as a personal-account sign-in and skip
-        # home-realm discovery — without this, an individual who also owns an
-        # Azure AD tenant (e.g. from registering this very app) can get
-        # intermittently routed into their own org's "work account only" login
-        # experience even though the app itself allows personal accounts.
-        "domain_hint": "consumers",
     }
     url = f"https://login.microsoftonline.com/{cfg['tenant_id']}/oauth2/v2.0/authorize?{urlencode(params)}"
     return {"url": url}

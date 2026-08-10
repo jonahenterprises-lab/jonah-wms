@@ -42,6 +42,7 @@ const TABS = [
 ];
 
 const MORE_TILES = [
+  { key: "search", icon: "🔎", label: "Search" },
   { key: "payout", icon: "💰", label: "Weekly Payout" },
   { key: "payments", icon: "💵", label: "Payments" },
   { key: "invoices", icon: "🧾", label: "GST Invoices" },
@@ -73,10 +74,10 @@ export function renderAdmin(frame, user, logout) {
   const state = { tab: "dashboard", view: "dashboard", params: {} };
 
   const nav = {
-    goTab(tab) {
+    goTab(tab, params = {}) {
       state.tab = tab;
       state.view = tab;
-      state.params = {};
+      state.params = params;
       render();
     },
     pushView(view, params = {}) {
@@ -107,6 +108,7 @@ export function renderAdmin(frame, user, logout) {
     doortypes: renderDoorTypes,
     notifications: renderNotifications,
     "worker-performance": renderWorkerPerformance,
+    search: renderGlobalSearch,
     settings: renderSettings,
     changepwd: renderChangePassword,
   };
@@ -360,7 +362,7 @@ async function renderApprovals(content) {
   load("Pending");
 }
 
-async function renderWorkers(content, nav) {
+async function renderWorkers(content, nav, logout, params = {}) {
   const workers = await get("/workers");
   content.innerHTML = `
     <div class="page-header-row">
@@ -503,7 +505,8 @@ async function renderWorkers(content, nav) {
   }
 
   renderList(workers);
-  content.querySelector("#worker-search").addEventListener("input", (e) => {
+  const workerSearchEl = content.querySelector("#worker-search");
+  workerSearchEl.addEventListener("input", (e) => {
     const q = e.target.value.trim().toLowerCase();
     renderList(
       q
@@ -516,6 +519,10 @@ async function renderWorkers(content, nav) {
         : workers
     );
   });
+  if (params.prefillSearch) {
+    workerSearchEl.value = params.prefillSearch;
+    workerSearchEl.dispatchEvent(new Event("input"));
+  }
 
   content.querySelector("#add-btn").addEventListener("click", () => {
     const wrap = content.querySelector("#add-form-wrap");
@@ -709,7 +716,7 @@ async function renderWorkerPerformance(content, nav, logout, params) {
   content.querySelector("#back-btn").addEventListener("click", () => nav.back("workers"));
 }
 
-async function renderSites(content) {
+async function renderSites(content, nav, logout, params = {}) {
   const [sites, doorTypes, workers] = await Promise.all([get("/sites"), get("/door-types"), get("/workers")]);
   const workerName = (id) => workers.find((w) => w.id === id)?.name || "Unknown";
   content.innerHTML = `
@@ -857,7 +864,8 @@ async function renderSites(content) {
 
   // Show/hide rather than re-render — a full re-render would remap each site's
   // index and desync the location-picker map instances wired to edit-site-${i}.
-  content.querySelector("#site-search").addEventListener("input", (e) => {
+  const siteSearchEl = content.querySelector("#site-search");
+  siteSearchEl.addEventListener("input", (e) => {
     const q = e.target.value.trim().toLowerCase();
     let anyVisible = false;
     sites.forEach((s, i) => {
@@ -876,6 +884,10 @@ async function renderSites(content) {
     });
     content.querySelector("#site-no-match").style.display = anyVisible || !sites.length ? "none" : "block";
   });
+  if (params.prefillSearch) {
+    siteSearchEl.value = params.prefillSearch;
+    siteSearchEl.dispatchEvent(new Event("input"));
+  }
 }
 
 async function renderMore(content, nav, logout, params, user) {
@@ -1466,6 +1478,85 @@ async function renderReportsExport(content, nav) {
       if (siteId) params.set("site_id", siteId);
       downloadWithToken(`/reports/export?${params.toString()}`);
     });
+  });
+}
+
+async function renderGlobalSearch(content, nav) {
+  content.innerHTML = `
+    <div class="back-row">
+      <button class="icon-btn" id="back-btn">←</button>
+      <h1 class="page-title">Search</h1>
+    </div>
+    <input type="search" id="global-search" placeholder="Search workers, sites, or clients…" autofocus />
+    <div id="global-search-results"></div>
+  `;
+  content.querySelector("#back-btn").addEventListener("click", () => nav.back("more"));
+  const resultsEl = content.querySelector("#global-search-results");
+  const searchEl = content.querySelector("#global-search");
+
+  let debounceTimer;
+  searchEl.addEventListener("input", () => {
+    clearTimeout(debounceTimer);
+    const q = searchEl.value.trim();
+    if (!q) {
+      resultsEl.innerHTML = "";
+      return;
+    }
+    debounceTimer = setTimeout(async () => {
+      resultsEl.innerHTML = '<div class="loading">Loading…</div>';
+      try {
+        const { workers, sites } = await get(`/search?q=${encodeURIComponent(q)}`);
+        if (!workers.length && !sites.length) {
+          resultsEl.innerHTML = '<div class="empty-state"><div class="title">No matches</div></div>';
+          return;
+        }
+        resultsEl.innerHTML = `
+          ${
+            workers.length
+              ? `<div class="section-label">Workers</div>${workers
+                  .map(
+                    (w) => `
+              <button class="list-card" data-kind="worker" style="width:100%;text-align:left;border:1px solid var(--border);cursor:pointer">
+                <div class="list-card-body">
+                  <div class="list-card-title">${escapeHtml(w.name)}</div>
+                  <div class="list-card-sub">${escapeHtml(w.employee_id || "")} · ${escapeHtml(w.mobile || "")}</div>
+                </div>
+                ${statusBadge(w.status)}
+              </button>
+            `
+                  )
+                  .join("")}`
+              : ""
+          }
+          ${
+            sites.length
+              ? `<div class="section-label">Sites</div>${sites
+                  .map(
+                    (s) => `
+              <button class="list-card" data-kind="site" style="width:100%;text-align:left;border:1px solid var(--border);cursor:pointer">
+                <div class="list-card-body">
+                  <div class="list-card-title">${escapeHtml(s.site_name)}</div>
+                  <div class="list-card-sub">${escapeHtml(s.client_name || "")} · ${escapeHtml(s.address || "")}</div>
+                </div>
+                ${statusBadge(s.status)}
+              </button>
+            `
+                  )
+                  .join("")}`
+              : ""
+          }
+        `;
+        resultsEl.querySelectorAll('[data-kind="worker"]').forEach((btn) => {
+          btn.addEventListener("click", () => nav.goTab("workers", { prefillSearch: q }));
+        });
+        resultsEl.querySelectorAll('[data-kind="site"]').forEach((btn) => {
+          btn.addEventListener("click", () => nav.goTab("sites", { prefillSearch: q }));
+        });
+      } catch (err) {
+        resultsEl.innerHTML = "";
+        showMessage(content, err.message, "error");
+      }
+    }, 250);
   });
 }
 

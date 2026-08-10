@@ -93,8 +93,6 @@ class LeaveStatus(str, Enum):
 
 
 class ApprovalStatus(str, Enum):
-    draft = "Draft"
-    submitted = "Submitted"
     pending = "Pending"
     approved = "Approved"
     rejected = "Rejected"
@@ -1776,6 +1774,30 @@ async def list_audit(
     if action: q["action"] = action
     items = await db.audit_logs.find(q, {"_id": 0}).sort("created_at", -1).limit(max(1, min(limit, 500))).to_list(500)
     return items
+
+
+@api.get("/search")
+async def global_search(q: str = Query(..., min_length=1), u=Depends(require_role(Role.admin))):
+    """One box across worker name/employee ID/mobile and site name/client/address —
+    not a replacement for the per-screen searches, an addition for "type a name,
+    find it wherever it lives" without knowing which screen it's on first."""
+    q_re = {"$regex": re.escape(q.strip()), "$options": "i"}
+    workers = await db.workers.find(
+        {"$or": [{"name": q_re}, {"employee_id": q_re}, {"mobile": q_re}]}, {"_id": 0}
+    ).limit(20).to_list(20)
+    sites = await db.sites.find(
+        {"$or": [{"site_name": q_re}, {"client_name": q_re}, {"address": q_re}]}, {"_id": 0}
+    ).limit(20).to_list(20)
+    return {
+        "workers": [
+            {"id": w["id"], "name": w["name"], "employee_id": w.get("employee_id"), "mobile": w.get("mobile"), "status": w.get("status")}
+            for w in workers
+        ],
+        "sites": [
+            {"id": s["id"], "site_name": s["site_name"], "client_name": s.get("client_name"), "address": s.get("address"), "status": s.get("status")}
+            for s in sites
+        ],
+    }
 
 
 # --- Branches ------------------------------------------------------------

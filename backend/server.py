@@ -1748,6 +1748,21 @@ async def create_leave(body: LeaveIn, u=Depends(require_role(Role.worker, Role.a
         raise HTTPException(400, "Only workers can request leave")
     if body.end_date < body.start_date:
         raise HTTPException(400, "end_date must be >= start_date")
+    # Overlap check against this worker's own still-live requests — a date range
+    # overlaps [start, end] when it starts on/before our end and ends on/after our
+    # start. ISO YYYY-MM-DD strings sort correctly with plain comparison.
+    overlap = await db.leaves.find_one({
+        "worker_id": u["worker_id"],
+        "status": {"$in": [LeaveStatus.pending.value, LeaveStatus.approved.value]},
+        "start_date": {"$lte": body.end_date},
+        "end_date": {"$gte": body.start_date},
+    }, {"_id": 0})
+    if overlap:
+        raise HTTPException(
+            400,
+            f"This overlaps your {overlap['status'].lower()} leave request for "
+            f"{overlap['start_date']} → {overlap['end_date']}.",
+        )
     doc = {
         "id": str(uuid.uuid4()),
         "worker_id": u["worker_id"],
@@ -1790,6 +1805,21 @@ async def _leave_decide(lid: str, new_status: str, remarks: str, u: dict):
     if wu:
         await add_notification(wu["id"], f"Leave {new_status}", f"Your leave {old['start_date']} → {old['end_date']} has been {new_status.lower()}.")
     return {**old, **upd}
+
+
+@api.delete("/leaves/{lid}")
+async def cancel_leave(lid: str, u=Depends(require_role(Role.worker))):
+    """Worker withdraws their own still-Pending request — mirrors work-report withdraw."""
+    old = await db.leaves.find_one({"id": lid}, {"_id": 0})
+    if not old:
+        raise HTTPException(404, "Not found")
+    if old["worker_id"] != u.get("worker_id"):
+        raise HTTPException(403, "Not your leave request")
+    if old["status"] != LeaveStatus.pending.value:
+        raise HTTPException(400, "Only a Pending request can be cancelled")
+    await db.leaves.delete_one({"id": lid})
+    await audit(u, "delete", "leave", lid, old, None)
+    return {"ok": True}
 
 
 @api.post("/leaves/{lid}/approve")

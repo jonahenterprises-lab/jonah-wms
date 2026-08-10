@@ -777,13 +777,20 @@ async function renderLeave(content, user, nav) {
           ? '<div class="empty-state"><div class="title">No leaves</div>Tap + to request leave.</div>'
           : leaves
               .map(
-                (l) => `
-        <div class="list-card">
+                (l, i) => `
+        <div class="list-card" style="flex-direction:column;align-items:stretch">
+          <div style="display:flex;justify-content:space-between">
           <div class="list-card-body">
             <div class="list-card-title">${escapeHtml(l.start_date)} → ${escapeHtml(l.end_date)}</div>
             <div class="list-card-sub">${escapeHtml(l.leave_type)} — ${escapeHtml(l.reason)}</div>
           </div>
           ${statusBadge(l.status)}
+          </div>
+          ${
+            l.status === "Pending"
+              ? `<button class="pill-btn outline pill-btn-sm text-danger" data-idx="${i}" data-action="cancel-leave" style="align-self:flex-start;margin-top:0.5rem">Cancel</button>`
+              : ""
+          }
         </div>
       `
               )
@@ -814,5 +821,19 @@ async function renderLeave(content, user, nav) {
       errorEl.textContent = err.message;
       btn.disabled = false;
     }
+  });
+  content.querySelectorAll('[data-action="cancel-leave"]').forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const l = leaves[Number(btn.dataset.idx)];
+      if (!confirm(`Cancel your leave request for ${l.start_date} → ${l.end_date}?`)) return;
+      btn.disabled = true;
+      try {
+        await del(`/leaves/${l.id}`);
+        renderLeave(content, user, nav);
+      } catch (err) {
+        showMessage(content, err.message, "error");
+        btn.disabled = false;
+      }
+    });
   });
 }

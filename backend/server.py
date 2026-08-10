@@ -92,6 +92,13 @@ class LeaveStatus(str, Enum):
     rejected = "Rejected"
 
 
+class PaymentRequestStatus(str, Enum):
+    pending = "Pending"
+    approved = "Approved"
+    rejected = "Rejected"
+    paid = "Paid"
+
+
 class ApprovalStatus(str, Enum):
     pending = "Pending"
     approved = "Approved"
@@ -224,6 +231,23 @@ class PaymentIn(BaseModel):
     transaction_reference: Optional[str] = ""
     notes: Optional[str] = ""
     client_sync_id: Optional[str] = None  # idempotency — a double-click must not double-pay
+
+
+class PaymentRequestIn(BaseModel):
+    amount: float = Field(gt=0)
+    note: Optional[str] = ""
+
+
+class PaymentRequestDecision(BaseModel):
+    remarks: Optional[str] = ""
+
+
+class PaymentRequestPayIn(BaseModel):
+    amount: Optional[float] = Field(default=None, gt=0)  # defaults to the requested amount if unset
+    payment_method: str = "UPI"
+    transaction_reference: Optional[str] = ""
+    notes: Optional[str] = ""
+    client_sync_id: Optional[str] = None
 
 
 class SettingsIn(BaseModel):
@@ -1761,6 +1785,151 @@ async def batch_payments(body: BatchPayIn, u=Depends(require_role(Role.admin))):
     return {"created": len(created), "payments": created, "warnings": warnings}
 
 
+# --- Payment Requests ------------------------------------------------------
+# Worker → request → admin reviews/approves/rejects → admin records the actual
+# payment (today: their usual method — UPI/cash/bank transfer done outside the
+# app, exactly like every other payment here). No automated bank transfer
+# happens anywhere in this flow — that's a deliberate choice, not a gap: real
+# money movement needs a live payout-API integration (e.g. IndusInd's Transfer
+# Payment API) wired in on top of this once that access is in place, with a
+# human still reviewing before anything executes.
+@api.post("/payment-requests")
+async def create_payment_request(body: PaymentRequestIn, u=Depends(require_role(Role.worker))):
+    if not u.get("worker_id"):
+        raise HTTPException(400, "Only workers can request payment")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "worker_id": u["worker_id"],
+        "worker_name": u.get("name"),
+        "amount": round(body.amount, 2),
+        "note": body.note or "",
+        "status": PaymentRequestStatus.pending.value,
+        "remarks": "",
+        "payment_id": None,
+        "created_at": now_utc().isoformat(),
+    }
+    await db.payment_requests.insert_one(doc.copy())
+    async for admin in db.users.find({"role": Role.admin.value}, {"_id": 0, "id": 1}):
+        await add_notification(admin["id"], "Payment Request", f"{u.get('name')} requested ₹{doc['amount']}.")
+    return clean(doc)
+
+
+@api.get("/payment-requests")
+async def list_payment_requests(u=Depends(get_user), status_f: Optional[str] = Query(None, alias="status")):
+    q = {}
+    if u["role"] == Role.worker.value:
+        q["worker_id"] = u.get("worker_id")
+    if status_f:
+        q["status"] = status_f
+    return await db.payment_requests.find(q, {"_id": 0}).sort("created_at", -1).to_list(500)
+
+
+@api.delete("/payment-requests/{rid}")
+async def cancel_payment_request(rid: str, u=Depends(require_role(Role.worker))):
+    old = await db.payment_requests.find_one({"id": rid}, {"_id": 0})
+    if not old:
+        raise HTTPException(404, "Not found")
+    if old["worker_id"] != u.get("worker_id"):
+        raise HTTPException(403, "Not your request")
+    if old["status"] != PaymentRequestStatus.pending.value:
+        raise HTTPException(400, "Only a Pending request can be cancelled")
+    await db.payment_requests.delete_one({"id": rid})
+    await audit(u, "delete", "payment_request", rid, old, None)
+    return {"ok": True}
+
+
+@api.post("/payment-requests/{rid}/approve")
+async def approve_payment_request(rid: str, body: PaymentRequestDecision, u=Depends(require_role(Role.admin))):
+    old = await db.payment_requests.find_one({"id": rid}, {"_id": 0})
+    if not old:
+        raise HTTPException(404, "Not found")
+    if old["status"] != PaymentRequestStatus.pending.value:
+        raise HTTPException(400, "Only a Pending request can be approved")
+    upd = {
+        "status": PaymentRequestStatus.approved.value, "remarks": body.remarks or "",
+        "decided_by": u["id"], "decided_by_name": u.get("name") or u.get("username"),
+        "decided_at": now_utc().isoformat(),
+    }
+    await db.payment_requests.update_one({"id": rid}, {"$set": upd})
+    await audit(u, "payment_request-approve", "payment_request", rid, old, upd)
+    wu = await db.users.find_one({"worker_id": old["worker_id"]}, {"_id": 0, "id": 1})
+    if wu:
+        await add_notification(wu["id"], "Payment Request Approved", f"Your request for ₹{old['amount']} was approved.")
+    return {**old, **upd}
+
+
+@api.post("/payment-requests/{rid}/reject")
+async def reject_payment_request(rid: str, body: PaymentRequestDecision, u=Depends(require_role(Role.admin))):
+    if not (body.remarks or "").strip():
+        raise HTTPException(400, "A reason is required to reject a payment request")
+    old = await db.payment_requests.find_one({"id": rid}, {"_id": 0})
+    if not old:
+        raise HTTPException(404, "Not found")
+    if old["status"] != PaymentRequestStatus.pending.value:
+        raise HTTPException(400, "Only a Pending request can be rejected")
+    upd = {
+        "status": PaymentRequestStatus.rejected.value, "remarks": body.remarks,
+        "decided_by": u["id"], "decided_by_name": u.get("name") or u.get("username"),
+        "decided_at": now_utc().isoformat(),
+    }
+    await db.payment_requests.update_one({"id": rid}, {"$set": upd})
+    await audit(u, "payment_request-reject", "payment_request", rid, old, upd)
+    wu = await db.users.find_one({"worker_id": old["worker_id"]}, {"_id": 0, "id": 1})
+    if wu:
+        await add_notification(wu["id"], "Payment Request Rejected", f"Your request for ₹{old['amount']} was rejected: {body.remarks}")
+    return {**old, **upd}
+
+
+@api.post("/payment-requests/{rid}/mark-paid")
+async def mark_payment_request_paid(rid: str, body: PaymentRequestPayIn, u=Depends(require_role(Role.admin))):
+    """Records the actual payment against an Approved request — the same manual
+    entry as every other payment in this app, just pre-linked back to the
+    request that prompted it. Idempotency-guarded like every other payment."""
+    old = await db.payment_requests.find_one({"id": rid}, {"_id": 0})
+    if not old:
+        raise HTTPException(404, "Not found")
+    if old["status"] != PaymentRequestStatus.approved.value:
+        raise HTTPException(400, "Only an Approved request can be marked paid")
+    if body.client_sync_id:
+        existing = await db.payments.find_one({"client_sync_id": body.client_sync_id}, {"_id": 0})
+        if existing:
+            return existing
+    worker = await db.workers.find_one({"id": old["worker_id"]}, {"_id": 0})
+    if not worker:
+        raise HTTPException(404, "Worker not found")
+    amount = round(body.amount if body.amount is not None else old["amount"], 2)
+    duplicate = await find_recent_duplicate_payment(old["worker_id"], amount)
+    payment_doc = {
+        "id": str(uuid.uuid4()),
+        "worker_id": old["worker_id"],
+        "worker_name": worker["name"],
+        "payment_date": now_utc().date().isoformat(),
+        "amount": amount,
+        "payment_method": body.payment_method,
+        "transaction_reference": body.transaction_reference or "",
+        "notes": body.notes or f"Payment request {rid}",
+        "created_by": u["id"],
+        "created_at": now_utc().isoformat(),
+    }
+    if body.client_sync_id:
+        payment_doc["client_sync_id"] = body.client_sync_id
+    await db.payments.insert_one(payment_doc.copy())
+    await audit(u, "create", "payment", payment_doc["id"], None, payment_doc)
+    req_upd = {"status": PaymentRequestStatus.paid.value, "payment_id": payment_doc["id"]}
+    await db.payment_requests.update_one({"id": rid}, {"$set": req_upd})
+    await audit(u, "payment_request-paid", "payment_request", rid, old, req_upd)
+    wu = await db.users.find_one({"worker_id": old["worker_id"]}, {"_id": 0, "id": 1})
+    if wu:
+        await add_notification(wu["id"], "Payment Sent", f"₹{amount} has been recorded as paid for your request.")
+    result = {**old, **req_upd, "payment": clean(payment_doc)}
+    if duplicate:
+        result["duplicate_warning"] = (
+            f"Another ₹{amount} payment to {worker['name']} was recorded at "
+            f"{formatted_ist(duplicate['created_at'])}. Please double-check this isn't a repeat."
+        )
+    return result
+
+
 # --- Audit log -----------------------------------------------------------
 @api.get("/audit-logs")
 async def list_audit(
@@ -2844,6 +3013,7 @@ async def startup():
     await db.payments.create_index([("worker_id", 1), ("payment_date", -1)])
     await db.notifications.create_index([("user_id", 1), ("created_at", -1)])
     await db.leaves.create_index([("worker_id", 1), ("status", 1)])
+    await db.payment_requests.create_index([("worker_id", 1), ("status", 1)])
     await db.report_photos.create_index("report_id")
 
     # settings

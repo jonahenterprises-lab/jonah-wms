@@ -581,9 +581,10 @@ function shareOnWhatsApp(p) {
 }
 
 async function renderPayments(content, user) {
-  const [ledger, payments] = await Promise.all([
+  const [ledger, payments, myRequests] = await Promise.all([
     get(`/workers/${user.worker_id}/ledger`),
     get("/payments"),
+    get("/payment-requests"),
   ]);
   content.innerHTML = `
     <h1 class="page-title">Payments</h1>
@@ -597,8 +598,50 @@ async function renderPayments(content, user) {
       <div class="stat-tile"><div class="stat-tile-label">Payment Received</div><div class="stat-tile-value">${money(ledger.summary.paid_amount)}</div></div>
       <div class="stat-tile"><div class="stat-tile-label">Pending Payment</div><div class="stat-tile-value">${money(ledger.summary.pending_amount)}</div></div>
     </div>
+    <button class="pill-btn" id="request-payment-btn">Request Payment</button>
+    <div id="request-form-wrap" style="display:none" class="card-block">
+      <form id="request-form">
+        <label>Amount<input name="amount" type="number" step="0.01" min="0.01" value="${ledger.summary.pending_amount > 0 ? ledger.summary.pending_amount : ""}" required /></label>
+        <label>Note (optional)<input name="note" placeholder="e.g. Need it before Friday" /></label>
+        <div class="error" id="request-error"></div>
+        <button type="submit" class="pill-btn">Submit Request</button>
+      </form>
+    </div>
     <button class="pill-btn outline" id="slip-btn">Download This Month's Slip</button>
     <div class="error" id="slip-error"></div>
+
+    ${
+      myRequests.length
+        ? `
+    <div class="section-label">Your Payment Requests</div>
+    <div id="request-list">
+      ${myRequests
+        .map(
+          (r, i) => `
+        <div class="list-card" style="flex-direction:column;align-items:stretch">
+          <div style="display:flex;justify-content:space-between">
+            <div class="list-card-body">
+              ${r.note ? `<div class="list-card-sub">${escapeHtml(r.note)}</div>` : ""}
+              ${r.remarks ? `<div class="list-card-meta">${escapeHtml(r.remarks)}</div>` : ""}
+            </div>
+            <div style="display:flex;flex-direction:column;align-items:flex-end;gap:0.3rem">
+              <div class="list-card-amount">${money(r.amount)}</div>
+              ${statusBadge(r.status)}
+            </div>
+          </div>
+          ${
+            r.status === "Pending"
+              ? `<button class="pill-btn outline pill-btn-sm text-danger" data-idx="${i}" data-action="cancel-request" style="align-self:flex-start;margin-top:0.5rem">Cancel</button>`
+              : ""
+          }
+        </div>
+      `
+        )
+        .join("")}
+    </div>
+    `
+        : ""
+    }
 
     <div class="section-label">Payment History</div>
     <div id="payment-list">
@@ -638,8 +681,45 @@ async function renderPayments(content, user) {
       btn.disabled = false;
     }
   });
-  content.querySelectorAll("[data-idx]").forEach((btn) => {
+  content.querySelectorAll("#payment-list [data-idx]").forEach((btn) => {
     btn.addEventListener("click", () => shareOnWhatsApp(payments[Number(btn.dataset.idx)]));
+  });
+
+  const requestFormWrap = content.querySelector("#request-form-wrap");
+  content.querySelector("#request-payment-btn").addEventListener("click", () => {
+    requestFormWrap.style.display = requestFormWrap.style.display === "none" ? "block" : "none";
+  });
+  content.querySelector("#request-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const errorEl = content.querySelector("#request-error");
+    errorEl.textContent = "";
+    const fd = new FormData(e.target);
+    const btn = e.target.querySelector('button[type="submit"]');
+    btn.disabled = true;
+    try {
+      await post("/payment-requests", {
+        amount: Number(fd.get("amount")),
+        note: fd.get("note"),
+      });
+      renderPayments(content, user);
+    } catch (err) {
+      errorEl.textContent = err.message;
+      btn.disabled = false;
+    }
+  });
+  content.querySelectorAll('[data-action="cancel-request"]').forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const req = myRequests[Number(btn.dataset.idx)];
+      if (!confirm(`Cancel your payment request for ${money(req.amount)}?`)) return;
+      btn.disabled = true;
+      try {
+        await del(`/payment-requests/${req.id}`);
+        renderPayments(content, user);
+      } catch (err) {
+        showMessage(content, err.message, "error");
+        btn.disabled = false;
+      }
+    });
   });
 }
 

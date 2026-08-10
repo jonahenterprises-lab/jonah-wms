@@ -45,6 +45,7 @@ const MORE_TILES = [
   { key: "search", icon: "🔎", label: "Search" },
   { key: "payout", icon: "💰", label: "Weekly Payout" },
   { key: "payments", icon: "💵", label: "Payments" },
+  { key: "payment-requests", icon: "🙋", label: "Payment Requests" },
   { key: "invoices", icon: "🧾", label: "GST Invoices" },
   { key: "leaves", icon: "📅", label: "Leaves" },
   { key: "attendance", icon: "🗺️", label: "Attendance & Map" },
@@ -100,6 +101,7 @@ export function renderAdmin(frame, user, logout) {
     more: renderMore,
     payout: renderPayout,
     payments: renderPayments,
+    "payment-requests": renderPaymentRequests,
     invoices: renderInvoices,
     leaves: renderLeaves,
     attendance: renderAttendance,
@@ -1052,6 +1054,136 @@ async function renderPayments(content, nav) {
     renderList(filtered);
   });
   renderList(payments);
+}
+
+async function renderPaymentRequests(content, nav) {
+  const filters = ["Pending", "Approved", "Rejected", "Paid"];
+  content.innerHTML = `
+    <div class="back-row">
+      <button class="icon-btn" id="back-btn">←</button>
+      <h1 class="page-title">Payment Requests</h1>
+    </div>
+    <p class="page-subtitle">Workers request payment here; you still pay them via your usual method (UPI/cash/bank transfer) and record it below — nothing is transferred automatically.</p>
+    <div class="filter-pills" id="filter-pills">
+      ${filters.map((f, i) => `<button class="filter-pill ${i === 0 ? "active" : ""}" data-status="${f}">${f}</button>`).join("")}
+    </div>
+    <div id="request-list"></div>
+  `;
+  content.querySelector("#back-btn").addEventListener("click", () => nav.back("more"));
+  const listEl = content.querySelector("#request-list");
+
+  async function load(status) {
+    listEl.innerHTML = '<div class="loading">Loading…</div>';
+    const requests = await get(`/payment-requests?status=${encodeURIComponent(status)}`);
+    listEl.innerHTML =
+      requests
+        .map(
+          (r, i) => `
+      <div class="list-card" style="flex-direction:column;align-items:stretch">
+        <div style="display:flex;justify-content:space-between">
+          <div class="list-card-body">
+            <div class="list-card-title">${escapeHtml(r.worker_name)}</div>
+            ${r.note ? `<div class="list-card-sub">${escapeHtml(r.note)}</div>` : ""}
+            ${r.remarks ? `<div class="list-card-meta">${escapeHtml(r.remarks)}</div>` : ""}
+          </div>
+          <div style="display:flex;flex-direction:column;align-items:flex-end;gap:0.3rem">
+            <div class="list-card-amount">${money(r.amount)}</div>
+            ${statusBadge(r.status)}
+          </div>
+        </div>
+        ${
+          status === "Pending"
+            ? `
+          <div class="actions" style="display:flex;gap:0.5rem;margin-top:0.6rem">
+            <button class="pill-btn pill-btn-sm" data-idx="${i}" data-action="approve">Approve</button>
+            <button class="pill-btn outline pill-btn-sm" data-idx="${i}" data-action="reject">Reject</button>
+          </div>
+        `
+            : ""
+        }
+        ${
+          status === "Approved"
+            ? `
+          <div class="actions" style="display:flex;gap:0.5rem;margin-top:0.6rem">
+            <button class="pill-btn pill-btn-sm" data-idx="${i}" data-action="mark-paid">Record Payment</button>
+          </div>
+        `
+            : ""
+        }
+      </div>
+    `
+        )
+        .join("") || `<div class="empty-state"><div class="title">Nothing here</div>No ${status.toLowerCase()} payment requests.</div>`;
+
+    listEl.querySelectorAll('[data-action="approve"]').forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const remarks = prompt("Remarks for approving (optional):", "") || "";
+        btn.disabled = true;
+        try {
+          await post(`/payment-requests/${requests[Number(btn.dataset.idx)].id}/approve`, { remarks });
+          load(status);
+        } catch (err) {
+          showMessage(content, err.message, "error");
+          btn.disabled = false;
+        }
+      });
+    });
+    listEl.querySelectorAll('[data-action="reject"]').forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const remarks = prompt("Reason for rejecting (required):", "");
+        if (remarks === null) return;
+        if (!remarks.trim()) {
+          alert("A reason is required to reject a payment request.");
+          return;
+        }
+        btn.disabled = true;
+        try {
+          await post(`/payment-requests/${requests[Number(btn.dataset.idx)].id}/reject`, { remarks });
+          load(status);
+        } catch (err) {
+          showMessage(content, err.message, "error");
+          btn.disabled = false;
+        }
+      });
+    });
+    listEl.querySelectorAll('[data-action="mark-paid"]').forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const req = requests[Number(btn.dataset.idx)];
+        const amountStr = prompt("Amount actually paid:", req.amount);
+        if (amountStr === null) return;
+        const amount = Number(amountStr);
+        if (!amount || amount <= 0) {
+          alert("Enter a valid amount.");
+          return;
+        }
+        const method = prompt("Payment method (UPI/Cash/Bank Transfer):", "UPI");
+        if (method === null) return;
+        const reference = prompt("Transaction reference (optional):", "") || "";
+        btn.disabled = true;
+        try {
+          const result = await post(`/payment-requests/${req.id}/mark-paid`, {
+            amount, payment_method: method || "UPI", transaction_reference: reference,
+            client_sync_id: uuid(),
+          });
+          load(status);
+          if (result.duplicate_warning) {
+            showMessage(content, result.duplicate_warning, "warning");
+          }
+        } catch (err) {
+          showMessage(content, err.message, "error");
+          btn.disabled = false;
+        }
+      });
+    });
+  }
+  content.querySelector("#filter-pills").querySelectorAll("button").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      content.querySelectorAll(".filter-pill").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      load(btn.dataset.status);
+    });
+  });
+  load("Pending");
 }
 
 function addInvoiceItemRow(itemsWrap, item) {

@@ -106,6 +106,7 @@ export function renderAdmin(frame, user, logout) {
     audit: renderAudit,
     doortypes: renderDoorTypes,
     notifications: renderNotifications,
+    "worker-performance": renderWorkerPerformance,
     settings: renderSettings,
     changepwd: renderChangePassword,
   };
@@ -359,7 +360,7 @@ async function renderApprovals(content) {
   load("Pending");
 }
 
-async function renderWorkers(content) {
+async function renderWorkers(content, nav) {
   const workers = await get("/workers");
   content.innerHTML = `
     <div class="page-header-row">
@@ -410,6 +411,7 @@ async function renderWorkers(content) {
           <div class="actions" style="display:flex;gap:0.5rem;margin-top:0.75rem;flex-wrap:wrap">
             <button class="pill-btn outline pill-btn-sm" data-id="${w.id}" data-action="reset-pwd">Reset Password</button>
             <button class="pill-btn outline pill-btn-sm" data-id="${w.id}" data-status="${w.status}" data-action="toggle-status">${w.status === "Active" ? "Disable" : "Activate"}</button>
+            <button class="pill-btn outline pill-btn-sm" data-id="${w.id}" data-name="${escapeHtml(w.name)}" data-action="performance">Performance</button>
             <button class="pill-btn outline pill-btn-sm" data-id="${w.id}" data-action="salary-slip">Salary Slip</button>
           </div>
         </div>
@@ -441,11 +443,16 @@ async function renderWorkers(content) {
             mobile: fd.get("mobile"),
             default_rate: Number(fd.get("default_rate")),
           });
-          renderWorkers(content);
+          renderWorkers(content, nav);
         } catch (err) {
           showMessage(content, err.message, "error");
           btn.disabled = false;
         }
+      });
+    });
+    listEl.querySelectorAll('[data-action="performance"]').forEach((btn) => {
+      btn.addEventListener("click", () => {
+        nav.pushView("worker-performance", { workerId: btn.dataset.id, workerName: btn.dataset.name });
       });
     });
     listEl.querySelectorAll('[data-action="salary-slip"]').forEach((btn) => {
@@ -486,7 +493,7 @@ async function renderWorkers(content) {
         btn.disabled = true;
         try {
           await put(`/workers/${btn.dataset.id}`, { status: nextStatus });
-          renderWorkers(content);
+          renderWorkers(content, nav);
         } catch (err) {
           showMessage(content, err.message, "error");
           btn.disabled = false;
@@ -530,7 +537,7 @@ async function renderWorkers(content) {
         password: fd.get("password"),
         default_rate: Number(fd.get("default_rate")),
       });
-      renderWorkers(content);
+      renderWorkers(content, nav);
     } catch (err) {
       errorEl.textContent = err.message;
       btn.disabled = false;
@@ -658,6 +665,48 @@ function assignedWorkersHtml(idPrefix, workers, existingIds) {
 
 function collectAssignedWorkers(form, idPrefix, workers) {
   return workers.filter((w) => form.querySelector(`[name="${idPrefix}-worker-${w.id}"]`)?.checked).map((w) => w.id);
+}
+
+async function renderWorkerPerformance(content, nav, logout, params) {
+  const p = await get(`/workers/${params.workerId}/performance`);
+  content.innerHTML = `
+    <div class="back-row">
+      <button class="icon-btn" id="back-btn">←</button>
+      <h1 class="page-title">${escapeHtml(p.worker_name)}</h1>
+    </div>
+    <p class="page-subtitle">Lifetime performance — all figures are all-time totals</p>
+
+    <div class="section-label">Installation</div>
+    <div class="stat-grid cols-3">
+      <div class="stat-tile"><div class="stat-tile-label">Doors Installed</div><div class="stat-tile-value">${p.total_doors}</div></div>
+      <div class="stat-tile"><div class="stat-tile-label">Working Days</div><div class="stat-tile-value">${p.working_days}</div></div>
+      <div class="stat-tile"><div class="stat-tile-label">Avg Doors/Day</div><div class="stat-tile-value">${p.avg_doors_per_day}</div></div>
+    </div>
+
+    <div class="section-label">Work Reports</div>
+    <div class="stat-grid cols-3">
+      <div class="stat-tile"><div class="stat-tile-label">Approved</div><div class="stat-tile-value">${p.approved_reports}</div></div>
+      <div class="stat-tile"><div class="stat-tile-label">Rejected</div><div class="stat-tile-value">${p.rejected_reports}</div></div>
+      <div class="stat-tile"><div class="stat-tile-label">Pending</div><div class="stat-tile-value">${p.pending_reports}</div></div>
+    </div>
+
+    <div class="section-label">Attendance</div>
+    <div class="stat-grid">
+      <div class="stat-tile"><div class="stat-tile-label">Completed Sessions</div><div class="stat-tile-value">${p.completed_sessions}</div></div>
+      <div class="stat-tile"><div class="stat-tile-label">On-Time Check-In</div><div class="stat-tile-value">${p.on_time_pct === null ? "—" : p.on_time_pct + "%"}</div></div>
+    </div>
+
+    <div class="section-label">Financials</div>
+    <div class="hero-block">
+      <div class="hero-label">Total Earned</div>
+      <div class="hero-value">${money(p.total_earned)}</div>
+    </div>
+    <div class="stat-grid">
+      <div class="stat-tile"><div class="stat-tile-label">Paid</div><div class="stat-tile-value">${money(p.total_paid)}</div></div>
+      <div class="stat-tile"><div class="stat-tile-label">Pending</div><div class="stat-tile-value">${money(p.pending_amount)}</div></div>
+    </div>
+  `;
+  content.querySelector("#back-btn").addEventListener("click", () => nav.back("workers"));
 }
 
 async function renderSites(content) {

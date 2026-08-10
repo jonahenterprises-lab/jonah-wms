@@ -1542,6 +1542,65 @@ async def worker_summary(worker_id: str, u=Depends(require_role(Role.admin, Role
     return await _worker_earnings(worker_id)
 
 
+@api.get("/workers/{worker_id}/performance")
+async def worker_performance(worker_id: str, u=Depends(require_role(Role.admin, Role.worker))):
+    """Lifetime performance metrics — only ones honestly computable from what we
+    actually track. No fabricated "attendance %"/score: that would need a concept
+    of an expected daily roster this system doesn't have."""
+    if u["role"] == Role.worker.value and u.get("worker_id") != worker_id:
+        raise HTTPException(403, "Forbidden")
+    worker = await db.workers.find_one({"id": worker_id}, {"_id": 0})
+    if not worker:
+        raise HTTPException(404, "Worker not found")
+
+    total_doors = 0
+    total_earned = 0.0
+    working_days = set()
+    approved_count = 0
+    rejected_count = 0
+    pending_count = 0
+    async for r in db.work_reports.find({"worker_id": worker_id}, {"_id": 0}):
+        status = r.get("approval_status")
+        if status == "Approved":
+            approved_count += 1
+            total_doors += r.get("door_count", 0)
+            total_earned += float(r.get("total_amount", 0))
+            working_days.add(r.get("work_date"))
+        elif status == "Rejected":
+            rejected_count += 1
+        elif status in ("Pending", "Correction"):
+            pending_count += 1
+
+    total_sessions = 0
+    late_sessions = 0
+    async for a in db.attendance_sessions.find(
+        {"worker_id": worker_id, "check_out_time": {"$ne": None}}, {"_id": 0, "late_flag": 1}
+    ):
+        total_sessions += 1
+        if a.get("late_flag"):
+            late_sessions += 1
+
+    paid = 0.0
+    async for p in db.payments.find({"worker_id": worker_id}, {"_id": 0, "amount": 1}):
+        paid += float(p.get("amount", 0))
+
+    return {
+        "worker_id": worker_id,
+        "worker_name": worker["name"],
+        "total_doors": total_doors,
+        "working_days": len(working_days),
+        "avg_doors_per_day": round(total_doors / len(working_days), 1) if working_days else 0,
+        "approved_reports": approved_count,
+        "rejected_reports": rejected_count,
+        "pending_reports": pending_count,
+        "completed_sessions": total_sessions,
+        "on_time_pct": round(100 * (total_sessions - late_sessions) / total_sessions, 1) if total_sessions else None,
+        "total_earned": round(total_earned, 2),
+        "total_paid": round(paid, 2),
+        "pending_amount": round(total_earned - paid, 2),
+    }
+
+
 # --- Settings ------------------------------------------------------------
 @api.get("/settings")
 async def get_settings(u=Depends(get_user)):

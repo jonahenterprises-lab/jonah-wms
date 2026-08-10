@@ -22,6 +22,7 @@ from typing import Annotated, List, Optional
 import certifi
 import httpx
 import jwt
+from xml.sax.saxutils import escape as _xml_escape
 from dotenv import load_dotenv
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -1943,6 +1944,14 @@ async def get_invoice(iid: str, u=Depends(require_role(Role.admin, Role.client))
     return inv
 
 
+def _pdf_text(value) -> str:
+    """Escape free text before it goes into a ReportLab Paragraph() — Paragraph
+    interprets a subset of XML/HTML-like markup in its input, so an unescaped
+    '<' or '&' in admin-entered text (a client name, notes, etc.) throws a parse
+    error and crashes that document's generation instead of just rendering oddly."""
+    return _xml_escape(str(value)) if value else ""
+
+
 def _build_invoice_pdf(inv: dict, company: dict) -> bytes:
     from reportlab.lib import colors as rlc
     from reportlab.lib.pagesizes import A4
@@ -1953,16 +1962,16 @@ def _build_invoice_pdf(inv: dict, company: dict) -> bytes:
     styles = getSampleStyleSheet()
     brand = ParagraphStyle("brand", parent=styles["Heading1"], textColor=rlc.HexColor("#423226"))
     story = [
-        Paragraph(company.get("company_name", "JONAH ENTERPRISES"), brand),
-        Paragraph(company.get("address") or "", styles["Normal"]),
-        Paragraph(f"{company.get('mobile') or ''}   {company.get('email') or ''}", styles["Normal"]),
+        Paragraph(_pdf_text(company.get("company_name", "JONAH ENTERPRISES")), brand),
+        Paragraph(_pdf_text(company.get("address")), styles["Normal"]),
+        Paragraph(f"{_pdf_text(company.get('mobile'))}   {_pdf_text(company.get('email'))}", styles["Normal"]),
         Spacer(1, 10),
-        Paragraph(f"<b>TAX INVOICE — {inv['invoice_number']}</b>", styles["Heading2"]),
-        Paragraph(f"Date: {inv['invoice_date']}   Due: {inv.get('due_date') or '-'}", styles["Normal"]),
+        Paragraph(f"<b>TAX INVOICE — {_pdf_text(inv['invoice_number'])}</b>", styles["Heading2"]),
+        Paragraph(f"Date: {_pdf_text(inv['invoice_date'])}   Due: {_pdf_text(inv.get('due_date')) or '-'}", styles["Normal"]),
         Spacer(1, 8),
-        Paragraph(f"<b>Bill to:</b> {inv['client_name']}", styles["Normal"]),
-        Paragraph(inv.get("client_address") or "", styles["Normal"]),
-        Paragraph(f"GSTIN: {inv.get('client_gstin') or '-'}", styles["Normal"]),
+        Paragraph(f"<b>Bill to:</b> {_pdf_text(inv['client_name'])}", styles["Normal"]),
+        Paragraph(_pdf_text(inv.get("client_address")), styles["Normal"]),
+        Paragraph(f"GSTIN: {_pdf_text(inv.get('client_gstin')) or '-'}", styles["Normal"]),
         Spacer(1, 10),
     ]
     header = ["Description", "HSN", "Qty", "Unit ₹", "Amount ₹"]
@@ -1990,7 +1999,7 @@ def _build_invoice_pdf(inv: dict, company: dict) -> bytes:
     story.append(t)
     if inv.get("notes"):
         story.append(Spacer(1, 12))
-        story.append(Paragraph(f"<b>Notes:</b> {inv['notes']}", styles["Normal"]))
+        story.append(Paragraph(f"<b>Notes:</b> {_pdf_text(inv['notes'])}", styles["Normal"]))
     doc.build(story)
     buf.seek(0)
     return buf.getvalue()
@@ -2060,12 +2069,12 @@ async def salary_slip(worker_id: str, month: Optional[str] = None, token: Option
     styles = getSampleStyleSheet()
     brand = ParagraphStyle("brand", parent=styles["Heading1"], textColor=rlc.HexColor("#423226"))
     story = [
-        Paragraph(company.get("company_name", "JONAH ENTERPRISES"), brand),
-        Paragraph(company.get("address") or "", styles["Normal"]),
+        Paragraph(_pdf_text(company.get("company_name", "JONAH ENTERPRISES")), brand),
+        Paragraph(_pdf_text(company.get("address")), styles["Normal"]),
         Spacer(1, 10),
         Paragraph(f"<b>PAYMENT SLIP — {month}</b>", styles["Heading2"]),
-        Paragraph(f"Worker: {worker['name']} ({worker.get('employee_id', '-')})", styles["Normal"]),
-        Paragraph(f"Mobile: {worker.get('mobile', '-')}", styles["Normal"]),
+        Paragraph(f"Worker: {_pdf_text(worker['name'])} ({_pdf_text(worker.get('employee_id')) or '-'})", styles["Normal"]),
+        Paragraph(f"Mobile: {_pdf_text(worker.get('mobile')) or '-'}", styles["Normal"]),
         Spacer(1, 10),
     ]
     # Actual blended rate for the month, not the worker's flat default_rate — door

@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, List, Optional
+from urllib.parse import urlencode, quote
 
 import certifi
 import httpx
@@ -27,12 +28,15 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, RedirectResponse
 from fastapi.security import OAuth2PasswordBearer
 from motor.motor_asyncio import AsyncIOMotorClient
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
 from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError
+
+import excel_sync
+from crypto_utils import encrypt_secret, decrypt_secret
 
 # --- Setup ---------------------------------------------------------------
 ROOT_DIR = Path(__file__).parent
@@ -97,6 +101,20 @@ class PaymentRequestStatus(str, Enum):
     approved = "Approved"
     rejected = "Rejected"
     paid = "Paid"
+
+
+class ExcelMatchStatus(str, Enum):
+    unresolved = "Unresolved"   # never checked against Excel yet
+    matched = "Matched"         # linked to an existing Excel master row
+    create_pending = "Create Pending"  # admin confirmed: no Excel equivalent, safe to auto-create
+    created = "Created"         # the app has created the Excel row for this record
+
+
+class ExcelSyncStatus(str, Enum):
+    not_applicable = "Not Applicable"  # Excel Integration isn't configured/connected
+    pending = "Pending"
+    synced = "Synced"
+    failed = "Failed"
 
 
 class ApprovalStatus(str, Enum):
@@ -262,6 +280,32 @@ class SettingsIn(BaseModel):
     shift_end_time: Optional[str] = None  # "HH:MM", IST — unset disables early-leave flagging
     late_grace_minutes: Optional[int] = None
     early_leave_grace_minutes: Optional[int] = None
+
+
+class ExcelIntegrationSettingsIn(BaseModel):
+    tenant_id: str = "common"
+    client_id: str
+    client_secret: str
+    workbook_file_path: str  # e.g. "/Documents/JONAH ENTERPRISES-ERP-2026-FINAL.xlsm"
+    redirect_uri: str
+
+
+class BankingSettingsIn(BaseModel):
+    provider_name: str = ""
+    api_base_url: str = ""
+    api_key: Optional[str] = ""
+    client_id: Optional[str] = ""
+    client_secret: Optional[str] = ""
+    merchant_id: Optional[str] = ""
+    webhook_url: Optional[str] = ""
+    webhook_secret: Optional[str] = ""
+    environment: str = "Sandbox"  # Sandbox | Production
+    enabled: bool = False
+
+
+class ExcelMappingConfirmIn(BaseModel):
+    excel_id: Optional[str] = None  # link to this existing Excel row's ID
+    create_new: bool = False        # confirm this app record has no Excel equivalent
 
 
 # --- Helpers -------------------------------------------------------------
@@ -632,6 +676,8 @@ async def create_site(body: SiteIn, u=Depends(require_role(Role.admin))):
     doc = body.dict()
     doc["id"] = str(uuid.uuid4())
     doc["created_at"] = now_utc().isoformat()
+    doc["excel_site_id"] = None
+    doc["excel_match_status"] = ExcelMatchStatus.unresolved.value
     await db.sites.insert_one(doc.copy())
     await audit(u, "create", "site", doc["id"], None, doc)
     return clean(doc)
@@ -674,6 +720,13 @@ async def create_door_type(body: DoorTypeIn, u=Depends(require_role(Role.admin))
     doc = body.dict()
     doc["id"] = str(uuid.uuid4())
     doc["created_at"] = now_utc().isoformat()
+    doc["excel_item_id"] = None
+    doc["excel_match_status"] = ExcelMatchStatus.unresolved.value
+    # cached from the matched M_ITEM row once mapped — Excel's Category/Specification
+    # split doesn't exist in the app's flat door_type name, so we mirror Excel's own
+    # values rather than trying to derive them from the app's name string.
+    doc["excel_work_category"] = None
+    doc["excel_specification"] = None
     await db.door_types.insert_one(doc.copy())
     await audit(u, "create", "door_type", doc["id"], None, doc)
     return clean(doc)
@@ -755,6 +808,14 @@ async def create_worker(body: WorkerIn, u=Depends(require_role(Role.admin))):
         "status": "Active",
         "notes": body.notes or "",
         "created_at": now_utc().isoformat(),
+        # Excel Integration — resolved by the one-time Excel Master Mapping screen
+        "excel_party_id": None,
+        "excel_match_status": ExcelMatchStatus.unresolved.value,
+        # Per-worker automation — set the moment this worker's first valid app
+        # work entry is created (not on login). Independent per worker.
+        "automation_enabled": False,
+        "first_valid_entry_at": None,
+        "automation_started_at": None,
     }
     await db.users.insert_one(user_doc.copy())
     await db.workers.insert_one(worker_doc.copy())
@@ -990,6 +1051,39 @@ async def active_session(u=Depends(require_role(Role.worker, Role.admin))):
 
 
 # --- Work reports --------------------------------------------------------
+async def _initial_excel_sync_status() -> str:
+    cfg = await db.excel_integration.find_one({"id": "global"}, {"_id": 0, "enabled": 1})
+    return ExcelSyncStatus.pending.value if (cfg and cfg.get("enabled")) else ExcelSyncStatus.not_applicable.value
+
+
+async def _next_entry_id() -> str:
+    """The app-wide idempotency key used as the Excel sync key (master prompt's
+    'Entry ID' requirement) — independent of Excel's own Work ID/Entry ID, which
+    are minted separately, in Excel, at sync time."""
+    r = await db.counters.find_one_and_update(
+        {"id": "work-report-entry"}, {"$inc": {"value": 1}}, upsert=True, return_document=True,
+    )
+    return f"ENTRY-{(r or {}).get('value', 1):06d}"
+
+
+async def _activate_worker_automation(worker_id: str) -> None:
+    """A worker's automation starts on their own first VALID app work entry —
+    never on login, never on a fixed calendar date, and never shared across
+    workers. 'Valid' means it passed submission validation (this function only
+    runs after a work_reports insert has already succeeded) — it is
+    deliberately NOT gated on later admin approval, since approval is a
+    business decision about the work, not evidence of whether the worker
+    started using the app."""
+    worker = await db.workers.find_one({"id": worker_id}, {"_id": 0, "automation_enabled": 1})
+    if worker and worker.get("automation_enabled"):
+        return  # already activated — never move the date on a later entry
+    ts = now_utc().isoformat()
+    await db.workers.update_one(
+        {"id": worker_id, "automation_enabled": {"$ne": True}},
+        {"$set": {"automation_enabled": True, "first_valid_entry_at": ts, "automation_started_at": ts}},
+    )
+
+
 @api.post("/work-reports")
 async def create_report(body: WorkReportIn, u=Depends(require_role(Role.worker, Role.admin))):
     # idempotency — scoped to this worker, same reasoning as check_in above
@@ -1071,8 +1165,10 @@ async def create_report(body: WorkReportIn, u=Depends(require_role(Role.worker, 
 
     before_photo_ids = await _store_photos(body.before_photos, "before")
     after_photo_ids = await _store_photos(body.after_photos, "after")
+    entry_id = await _next_entry_id()
     doc = {
         "id": report_id,
+        "entry_id": entry_id,
         "session_id": body.session_id,
         "worker_id": sess["worker_id"],
         "worker_name": sess.get("worker_name"),
@@ -1093,10 +1189,19 @@ async def create_report(body: WorkReportIn, u=Depends(require_role(Role.worker, 
         "approved_by": None,
         "approved_at": None,
         "created_at": now_utc().isoformat(),
+        # Excel Integration — nothing syncs until the report is Approved (Excel's
+        # T_WORK has no "pending review" concept; see the audit report). The DB
+        # stays the source of truth regardless of sync outcome.
+        "excel_sync_status": ExcelSyncStatus.not_applicable.value,
+        "excel_sync_attempts": 0,
+        "excel_last_synced_at": None,
+        "excel_last_error": None,
+        "excel_work_ids": [],
     }
     if body.client_sync_id:
         doc["client_sync_id"] = body.client_sync_id
     await db.work_reports.insert_one(doc.copy())
+    await _activate_worker_automation(sess["worker_id"])
     async for admin in db.users.find({"role": Role.admin.value}, {"_id": 0, "id": 1}):
         await add_notification(admin["id"], "New Work Report", f"{sess.get('worker_name')} submitted a report ({door_count} doors).")
     return clean(doc)
@@ -1247,6 +1352,15 @@ async def _approval_action(report_id: str, new_status: str, body: ApprovalIn, u:
         upd["door_count"] = dc
         upd["rate_per_door"] = rate
         upd["total_amount"] = round(dc * rate, 2)
+        # Excel's T_WORK has no "pending review" concept (verified in the audit) —
+        # a report only ever syncs once it's Approved. Re-approving after an edit
+        # or an unapprove/reapprove cycle re-syncs the SAME row(s) via excel_work_ids,
+        # it never creates a duplicate.
+        upd["excel_sync_status"] = await _initial_excel_sync_status()
+    elif new_status == ApprovalStatus.rejected.value and r.get("excel_work_ids"):
+        # Already-synced work got rejected after the fact — the row must be
+        # flagged, never silently deleted from Excel.
+        upd["excel_sync_status"] = await _initial_excel_sync_status()
     await db.work_reports.update_one({"id": report_id}, {"$set": upd})
     await audit(u, f"report-{new_status.lower()}", "work_report", report_id, r, upd)
     # notify worker
@@ -1357,6 +1471,11 @@ async def create_payment(body: PaymentIn, u=Depends(require_role(Role.admin))):
         "notes": body.notes or "",
         "created_by": u["id"],
         "created_at": now_utc().isoformat(),
+        "excel_sync_status": await _initial_excel_sync_status(),
+        "excel_sync_attempts": 0,
+        "excel_last_synced_at": None,
+        "excel_last_error": None,
+        "excel_entry_id": None,
     }
     if body.client_sync_id:
         doc["client_sync_id"] = body.client_sync_id
@@ -1910,6 +2029,11 @@ async def mark_payment_request_paid(rid: str, body: PaymentRequestPayIn, u=Depen
         "notes": body.notes or f"Payment request {rid}",
         "created_by": u["id"],
         "created_at": now_utc().isoformat(),
+        "excel_sync_status": await _initial_excel_sync_status(),
+        "excel_sync_attempts": 0,
+        "excel_last_synced_at": None,
+        "excel_last_error": None,
+        "excel_entry_id": None,
     }
     if body.client_sync_id:
         payment_doc["client_sync_id"] = body.client_sync_id
@@ -1928,6 +2052,615 @@ async def mark_payment_request_paid(rid: str, body: PaymentRequestPayIn, u=Depen
             f"{formatted_ist(duplicate['created_at'])}. Please double-check this isn't a repeat."
         )
     return result
+
+
+# --- Excel Integration (Microsoft Graph / OneDrive) -----------------------
+# Admin-only throughout. Workers never see any endpoint or setting in this
+# section — enforced the same way as everywhere else (require_role(Role.admin)).
+def _fy_label(d: Optional[datetime] = None) -> str:
+    d = d or now_utc()
+    y = d.year
+    if d.month < 4:
+        y -= 1
+    return f"FY {y % 100:02d}-{(y + 1) % 100:02d}"
+
+
+async def _get_excel_access_token() -> str:
+    cfg = await db.excel_integration.find_one({"id": "global"}, {"_id": 0})
+    if not cfg or not cfg.get("refresh_token_enc"):
+        raise HTTPException(400, "Excel Integration is not connected")
+    expires_at = cfg.get("token_expires_at")
+    fresh_enough = False
+    if expires_at:
+        try:
+            fresh_enough = datetime.fromisoformat(expires_at) - now_utc() > timedelta(minutes=5)
+        except ValueError:
+            fresh_enough = False
+    if fresh_enough:
+        token = decrypt_secret(cfg.get("access_token_enc"))
+        if token:
+            return token
+    refresh_token = decrypt_secret(cfg.get("refresh_token_enc"))
+    client_secret = decrypt_secret(cfg.get("client_secret_enc"))
+    if not refresh_token or not client_secret:
+        raise HTTPException(400, "Excel Integration needs to be reconnected")
+    try:
+        tokens = await excel_sync.refresh_access_token(cfg["tenant_id"], cfg["client_id"], client_secret, refresh_token)
+    except excel_sync.GraphAPIError as e:
+        raise HTTPException(502, f"Could not refresh Microsoft Graph token: {e}")
+    new_expiry = (now_utc() + timedelta(seconds=tokens.get("expires_in", 3600))).isoformat()
+    await db.excel_integration.update_one({"id": "global"}, {"$set": {
+        "access_token_enc": encrypt_secret(tokens["access_token"]),
+        "refresh_token_enc": encrypt_secret(tokens.get("refresh_token") or refresh_token),
+        "token_expires_at": new_expiry,
+    }})
+    return tokens["access_token"]
+
+
+async def _get_excel_store():
+    cfg = await db.excel_integration.find_one({"id": "global"}, {"_id": 0})
+    if not cfg or not cfg.get("enabled") or not cfg.get("drive_item_id"):
+        raise HTTPException(400, "Excel Integration is not configured/connected")
+    return excel_sync.GraphExcelStore(cfg["drive_item_id"], _get_excel_access_token)
+
+
+@api.get("/excel-integration/settings")
+async def get_excel_integration_settings(u=Depends(require_role(Role.admin))):
+    cfg = await db.excel_integration.find_one({"id": "global"}, {"_id": 0}) or {}
+    return {
+        "enabled": cfg.get("enabled", False),
+        "tenant_id": cfg.get("tenant_id"),
+        "client_id": cfg.get("client_id"),
+        "workbook_file_path": cfg.get("workbook_file_path"),
+        "redirect_uri": cfg.get("redirect_uri"),
+        "connected": bool(cfg.get("refresh_token_enc")),
+        "workbook_name": cfg.get("workbook_name"),
+        "last_connection_test_at": cfg.get("last_connection_test_at"),
+        "last_connection_test_ok": cfg.get("last_connection_test_ok"),
+        "last_connection_test_message": cfg.get("last_connection_test_message"),
+        "node_letter": excel_sync.NODE_LETTER,
+    }
+
+
+@api.put("/excel-integration/settings")
+async def update_excel_integration_settings(body: ExcelIntegrationSettingsIn, u=Depends(require_role(Role.admin))):
+    old = await db.excel_integration.find_one({"id": "global"}, {"_id": 0})
+    upd = {
+        "tenant_id": body.tenant_id.strip() or "common",
+        "client_id": body.client_id.strip(),
+        "client_secret_enc": encrypt_secret(body.client_secret),
+        "workbook_file_path": body.workbook_file_path.strip(),
+        "redirect_uri": body.redirect_uri.strip(),
+        "updated_by": u["id"],
+        "updated_at": now_utc().isoformat(),
+    }
+    await db.excel_integration.update_one({"id": "global"}, {"$set": upd}, upsert=True)
+    safe_old = {k: v for k, v in (old or {}).items() if not k.endswith("_enc")}
+    safe_new = {k: v for k, v in upd.items() if not k.endswith("_enc")}
+    await audit(u, "update", "excel_integration_settings", "global", safe_old, safe_new)
+    return {"ok": True}
+
+
+@api.get("/excel-integration/oauth/start")
+async def excel_oauth_start(u=Depends(require_role(Role.admin))):
+    cfg = await db.excel_integration.find_one({"id": "global"}, {"_id": 0})
+    if not cfg or not cfg.get("client_id") or not cfg.get("redirect_uri") or not cfg.get("client_secret_enc"):
+        raise HTTPException(400, "Set Tenant ID, Client ID, Client Secret and Redirect URI first")
+    state = secrets.token_urlsafe(24)
+    await db.excel_integration.update_one({"id": "global"}, {"$set": {
+        "oauth_state": state,
+        "oauth_state_expires": (now_utc() + timedelta(minutes=10)).isoformat(),
+    }})
+    params = {
+        "client_id": cfg["client_id"],
+        "response_type": "code",
+        "redirect_uri": cfg["redirect_uri"],
+        "response_mode": "query",
+        "scope": "offline_access Files.ReadWrite",
+        "state": state,
+    }
+    url = f"https://login.microsoftonline.com/{cfg['tenant_id']}/oauth2/v2.0/authorize?{urlencode(params)}"
+    return {"url": url}
+
+
+@api.get("/excel-integration/oauth/callback")
+async def excel_oauth_callback(code: Optional[str] = None, state: Optional[str] = None,
+                                error: Optional[str] = None, error_description: Optional[str] = None):
+    cfg = await db.excel_integration.find_one({"id": "global"}, {"_id": 0})
+    if error:
+        return RedirectResponse(url=f"/?excel_connected=0&msg={quote(error_description or error)}")
+    if not cfg or not state or state != cfg.get("oauth_state"):
+        return RedirectResponse(url="/?excel_connected=0&msg=" + quote("Invalid or expired sign-in attempt. Please retry."))
+    expires = cfg.get("oauth_state_expires")
+    if expires and datetime.fromisoformat(expires) < now_utc():
+        return RedirectResponse(url="/?excel_connected=0&msg=" + quote("This sign-in link expired. Please retry."))
+    client_secret = decrypt_secret(cfg.get("client_secret_enc"))
+    try:
+        tokens = await excel_sync.exchange_code_for_tokens(
+            cfg["tenant_id"], cfg["client_id"], client_secret, code, cfg["redirect_uri"]
+        )
+    except excel_sync.GraphAPIError as e:
+        return RedirectResponse(url="/?excel_connected=0&msg=" + quote(f"Microsoft token exchange failed: {e}"))
+    upd = {
+        "access_token_enc": encrypt_secret(tokens["access_token"]),
+        "refresh_token_enc": encrypt_secret(tokens.get("refresh_token")),
+        "token_expires_at": (now_utc() + timedelta(seconds=tokens.get("expires_in", 3600))).isoformat(),
+        "oauth_state": None, "oauth_state_expires": None,
+    }
+
+    async def _token_getter():
+        return tokens["access_token"]
+
+    try:
+        file_info = await excel_sync.resolve_file_by_path(_token_getter, cfg["workbook_file_path"])
+        upd["drive_item_id"] = file_info["id"]
+        upd["workbook_name"] = file_info.get("name")
+        upd["enabled"] = True
+        upd["last_connection_test_at"] = now_utc().isoformat()
+        upd["last_connection_test_ok"] = True
+        upd["last_connection_test_message"] = "Connected"
+        await db.excel_integration.update_one({"id": "global"}, {"$set": upd})
+        try:
+            store = excel_sync.GraphExcelStore(upd["drive_item_id"], _token_getter)
+            await excel_sync.ensure_tser_node_p_rows(store, _fy_label())
+        except excel_sync.GraphAPIError:
+            pass  # connection itself succeeded; TSER setup can be retried by the sync loop
+        return RedirectResponse(url="/?excel_connected=1")
+    except excel_sync.GraphAPIError as e:
+        upd["enabled"] = False
+        upd["last_connection_test_ok"] = False
+        upd["last_connection_test_message"] = f"Signed in, but couldn't find the workbook at that path: {e}"
+        await db.excel_integration.update_one({"id": "global"}, {"$set": upd})
+        return RedirectResponse(url="/?excel_connected=0&msg=" + quote(upd["last_connection_test_message"]))
+
+
+@api.post("/excel-integration/test-connection")
+async def test_excel_connection(u=Depends(require_role(Role.admin))):
+    try:
+        store = await _get_excel_store()
+        await store.get_headers("TW")  # cheapest real round-trip that proves read access
+        msg = "Connected — workbook is reachable and the TW table is readable."
+        ok = True
+    except (HTTPException, excel_sync.GraphAPIError) as e:
+        ok = False
+        msg = e.detail if isinstance(e, HTTPException) else str(e)
+    await db.excel_integration.update_one({"id": "global"}, {"$set": {
+        "last_connection_test_at": now_utc().isoformat(),
+        "last_connection_test_ok": ok,
+        "last_connection_test_message": msg,
+    }})
+    return {"ok": ok, "message": msg}
+
+
+@api.post("/excel-integration/disconnect")
+async def disconnect_excel(u=Depends(require_role(Role.admin))):
+    old = await db.excel_integration.find_one({"id": "global"}, {"_id": 0})
+    await db.excel_integration.update_one({"id": "global"}, {"$set": {
+        "enabled": False, "access_token_enc": None, "refresh_token_enc": None,
+        "token_expires_at": None, "drive_item_id": None, "workbook_name": None,
+    }})
+    await audit(u, "disconnect", "excel_integration_settings", "global", old, {"enabled": False})
+    return {"ok": True}
+
+
+# --- Excel Master Mapping — worker/site/door-type <-> M_PARTY/M_SITE/M_ITEM
+_MAPPING_COLLECTIONS = {
+    "worker": {
+        "coll": "workers", "excel_id_field": "excel_party_id", "excel_table": "TP",
+        "excel_id_col": "Party ID", "excel_legacy_col": "Legacy ID", "app_legacy_field": "employee_id",
+        "excel_name_col": "Party Name", "app_name_field": "name",
+    },
+    "site": {
+        "coll": "sites", "excel_id_field": "excel_site_id", "excel_table": "TS",
+        "excel_id_col": "Site ID", "excel_legacy_col": "Legacy ID", "app_legacy_field": None,
+        "excel_name_col": "Site Name", "app_name_field": "site_name",
+    },
+    "door_type": {
+        "coll": "door_types", "excel_id_field": "excel_item_id", "excel_table": "TI",
+        "excel_id_col": "Item ID", "excel_legacy_col": "Legacy Key", "app_legacy_field": None,
+        "excel_name_col": "Work Category / Item Name", "app_name_field": "name",
+    },
+}
+
+
+@api.get("/excel-integration/mapping/{kind}")
+async def excel_mapping_list(kind: str, u=Depends(require_role(Role.admin))):
+    cfg = _MAPPING_COLLECTIONS.get(kind)
+    if not cfg:
+        raise HTTPException(404, "Unknown mapping kind")
+    store = await _get_excel_store()
+    excel_rows = await store.get_rows(cfg["excel_table"])
+    app_docs = await db[cfg["coll"]].find({}, {"_id": 0}).to_list(1000)
+
+    matched, unresolved = [], []
+    for doc in app_docs:
+        if doc.get(cfg["excel_id_field"]) or doc.get("excel_match_status") in (
+            ExcelMatchStatus.matched.value, ExcelMatchStatus.create_pending.value, ExcelMatchStatus.created.value,
+        ):
+            matched.append(doc)
+            continue
+        # Decision #1: exact Legacy ID / employee_id match auto-resolves, no confirm needed
+        auto_row = None
+        if cfg["app_legacy_field"] and doc.get(cfg["app_legacy_field"]):
+            wanted = str(doc[cfg["app_legacy_field"]]).strip().lower()
+            candidates = [
+                r for r in excel_rows
+                if str(r["values"].get(cfg["excel_legacy_col"]) or "").strip().lower() == wanted
+            ]
+            if len(candidates) == 1:
+                auto_row = candidates[0]
+        if auto_row:
+            new_excel_id = auto_row["values"].get(cfg["excel_id_col"])
+            await db[cfg["coll"]].update_one({"id": doc["id"]}, {"$set": {
+                cfg["excel_id_field"]: new_excel_id, "excel_match_status": ExcelMatchStatus.matched.value,
+            }})
+            doc[cfg["excel_id_field"]] = new_excel_id
+            doc["excel_match_status"] = ExcelMatchStatus.matched.value
+            matched.append(doc)
+            continue
+        # Everything else — unmatched or ambiguous — goes to the one-time confirm queue.
+        # Never auto-created (decision #1: "do not silently create duplicate workers").
+        app_name = str(doc.get(cfg["app_name_field"]) or "").strip().lower()
+        suggestions = [
+            {"excel_id": r["values"].get(cfg["excel_id_col"]), "name": r["values"].get(cfg["excel_name_col"])}
+            for r in excel_rows
+            if app_name and app_name in str(r["values"].get(cfg["excel_name_col"]) or "").strip().lower()
+        ][:5]
+        unresolved.append({**doc, "suggestions": suggestions})
+    return {"matched_count": len(matched), "unresolved": unresolved}
+
+
+@api.post("/excel-integration/mapping/{kind}/{app_id}/confirm")
+async def excel_mapping_confirm(kind: str, app_id: str, body: ExcelMappingConfirmIn, u=Depends(require_role(Role.admin))):
+    cfg = _MAPPING_COLLECTIONS.get(kind)
+    if not cfg:
+        raise HTTPException(404, "Unknown mapping kind")
+    doc = await db[cfg["coll"]].find_one({"id": app_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Not found")
+    if body.create_new:
+        # Decision #2: auto-create the master row — but only after this explicit,
+        # one-click admin confirmation that no Excel equivalent exists.
+        upd = {"excel_match_status": ExcelMatchStatus.create_pending.value}
+    elif body.excel_id:
+        upd = {cfg["excel_id_field"]: body.excel_id, "excel_match_status": ExcelMatchStatus.matched.value}
+        if kind == "door_type":
+            store = await _get_excel_store()
+            row = await excel_sync.find_row_by_id(store, "TI", "Item ID", body.excel_id)
+            if row:
+                upd["excel_work_category"] = row["values"].get("Work Category / Item Name")
+                upd["excel_specification"] = row["values"].get("Specification")
+    else:
+        raise HTTPException(400, "Provide either excel_id or create_new")
+    await db[cfg["coll"]].update_one({"id": app_id}, {"$set": upd})
+    await audit(u, "excel-mapping-confirm", kind, app_id, doc, upd)
+    return {"ok": True}
+
+
+async def _ensure_excel_master_row(kind: str, app_doc: dict, store) -> str:
+    """Returns the Excel ID for this record, auto-creating the master row only
+    when the admin has already confirmed (create_pending) it has no Excel
+    equivalent. Raises if it's still Unresolved — those must be resolved once
+    in Excel Master Mapping first (never silently created)."""
+    cfg = _MAPPING_COLLECTIONS[kind]
+    status = app_doc.get("excel_match_status")
+    existing_id = app_doc.get(cfg["excel_id_field"])
+    if existing_id and status in (ExcelMatchStatus.matched.value, ExcelMatchStatus.created.value):
+        return existing_id
+    if status != ExcelMatchStatus.create_pending.value:
+        raise RuntimeError(
+            f"{kind} '{app_doc.get(cfg['app_name_field'])}' isn't linked to Excel yet — "
+            f"resolve it in Excel Master Mapping first."
+        )
+    new_id = await excel_sync.mint_master_id(store, kind)
+    row = {cfg["excel_id_col"]: new_id, cfg["excel_name_col"]: app_doc.get(cfg["app_name_field"]), "Active": "Yes"}
+    if kind == "worker":
+        row["Party Type"] = "Worker"
+        row["Phone"] = app_doc.get("mobile")
+        row["Legacy ID"] = app_doc.get("employee_id")
+    elif kind == "site":
+        row["Site Address"] = app_doc.get("address")
+    elif kind == "door_type":
+        row["Item Type"] = "Service"
+    await store.add_row(cfg["excel_table"], row)
+    await db[cfg["coll"]].update_one({"id": app_doc["id"]}, {"$set": {
+        cfg["excel_id_field"]: new_id, "excel_match_status": ExcelMatchStatus.created.value,
+    }})
+    return new_id
+
+
+# --- Excel sync engine — idempotent (entry_id / excel_work_ids / excel_entry_id
+# are the upsert keys, never re-derived from a name match) -----------------
+async def _sync_work_report_now(report_id: str) -> None:
+    report = await db.work_reports.find_one({"id": report_id}, {"_id": 0})
+    if not report:
+        return
+    try:
+        store = await _get_excel_store()
+        worker = await db.workers.find_one({"id": report["worker_id"]}, {"_id": 0})
+        site = await db.sites.find_one({"id": report["site_id"]}, {"_id": 0})
+        if not worker or not site:
+            raise RuntimeError("Worker or site no longer exists")
+        worker_excel_id = await _ensure_excel_master_row("worker", worker, store)
+        site_excel_id = await _ensure_excel_master_row("site", site, store)
+
+        fy = _fy_label()
+        work_ids = list(report.get("excel_work_ids") or [])
+        rejected = report.get("approval_status") == ApprovalStatus.rejected.value
+        for i, item in enumerate(report.get("door_breakdown", [])):
+            door_type = await db.door_types.find_one({"id": item["door_type_id"]}, {"_id": 0})
+            item_excel_id = await _ensure_excel_master_row("door_type", door_type, store) if door_type else ""
+            row = {
+                "Date": report["work_date"],
+                "Month": datetime.fromisoformat(report["work_date"]).strftime("%b-%Y"),
+                "Site ID": site_excel_id,
+                "Site Name": site["site_name"],
+                "Item ID": item_excel_id,
+                "Work Category": (door_type or {}).get("excel_work_category") or item.get("door_type_name"),
+                "Specification": (door_type or {}).get("excel_specification") or "",
+                "Worker ID": worker_excel_id,
+                "Worker Name": worker["name"],
+                "Qty": item["count"],
+                "Cost Rate": item["rate"],
+                "Cost Amount": item["subtotal"],
+                "Billing Rate": 0,
+                "Billable Amount": 0,
+                "Work Status": "Completed",
+                "Billed?": "No",
+                "Data Check": "APP: rejected after sync — verify before billing" if rejected else "",
+                "Remarks": f"[App {report['entry_id']}] {report.get('notes') or ''}".strip(),
+            }
+            if i < len(work_ids):
+                existing = await excel_sync.find_row_by_id(store, "TW", "Work ID", work_ids[i])
+                if existing:
+                    await store.update_row("TW", existing["index"], row)
+                    continue
+                # row vanished from Excel (e.g. a human deleted it) — recreate below
+            new_id = await excel_sync.mint_transactional_id(store, "WORK", fy)
+            row["Work ID"] = new_id
+            await store.add_row("TW", row)
+            if i < len(work_ids):
+                work_ids[i] = new_id
+            else:
+                work_ids.append(new_id)
+
+        await db.work_reports.update_one({"id": report_id}, {
+            "$set": {
+                "excel_sync_status": ExcelSyncStatus.synced.value,
+                "excel_last_synced_at": now_utc().isoformat(),
+                "excel_last_error": None,
+                "excel_work_ids": work_ids,
+            },
+            "$inc": {"excel_sync_attempts": 1},
+        })
+    except Exception as e:
+        logger.warning(f"Excel sync failed for work report {report_id}: {e}")
+        await db.work_reports.update_one({"id": report_id}, {
+            "$set": {"excel_sync_status": ExcelSyncStatus.failed.value, "excel_last_error": str(e)[:500]},
+            "$inc": {"excel_sync_attempts": 1},
+        })
+
+
+async def _sync_payment_now(payment_id: str) -> None:
+    payment = await db.payments.find_one({"id": payment_id}, {"_id": 0})
+    if not payment:
+        return
+    try:
+        store = await _get_excel_store()
+        worker = await db.workers.find_one({"id": payment["worker_id"]}, {"_id": 0})
+        if not worker:
+            raise RuntimeError("Worker no longer exists")
+        worker_excel_id = await _ensure_excel_master_row("worker", worker, store)
+        fy = _fy_label()
+        row = {
+            "Voucher Type": "LABPAY",
+            "Date": payment["payment_date"],
+            "Month": datetime.fromisoformat(payment["payment_date"]).strftime("%b-%Y"),
+            "Party ID": worker_excel_id,
+            "Party Name": worker["name"],
+            "Amount": payment["amount"],
+            "Payment Type": "Final Payment",
+            "Mode": payment.get("payment_method") or "Cash",
+            "UTR / Cheque / Ref": payment.get("transaction_reference") or "",
+            "Narration": f"[App payment {payment['id'][:8]}] {payment.get('notes') or ''}".strip(),
+        }
+        existing_entry_id = payment.get("excel_entry_id")
+        if existing_entry_id:
+            existing = await excel_sync.find_row_by_id(store, "TL", "Entry ID", existing_entry_id)
+            if existing:
+                await store.update_row("TL", existing["index"], row)
+            else:
+                existing_entry_id = None  # row vanished — recreate below
+        if not existing_entry_id:
+            row["Voucher No."] = await excel_sync.mint_transactional_id(store, "LABPAY", fy)
+            existing_entry_id = await excel_sync.mint_ledger_entry_id(store)
+            row["Entry ID"] = existing_entry_id
+            await store.add_row("TL", row)
+
+        await db.payments.update_one({"id": payment_id}, {
+            "$set": {
+                "excel_sync_status": ExcelSyncStatus.synced.value,
+                "excel_last_synced_at": now_utc().isoformat(),
+                "excel_last_error": None,
+                "excel_entry_id": existing_entry_id,
+            },
+            "$inc": {"excel_sync_attempts": 1},
+        })
+    except Exception as e:
+        logger.warning(f"Excel sync failed for payment {payment_id}: {e}")
+        await db.payments.update_one({"id": payment_id}, {
+            "$set": {"excel_sync_status": ExcelSyncStatus.failed.value, "excel_last_error": str(e)[:500]},
+            "$inc": {"excel_sync_attempts": 1},
+        })
+
+
+EXCEL_SYNC_MAX_ATTEMPTS = 8
+EXCEL_SYNC_INTERVAL_SECONDS = 300
+
+
+async def _run_excel_sync_pass(limit: int = 50) -> dict:
+    pending_q = {
+        "excel_sync_status": {"$in": [ExcelSyncStatus.pending.value, ExcelSyncStatus.failed.value]},
+        "excel_sync_attempts": {"$lt": EXCEL_SYNC_MAX_ATTEMPTS},
+    }
+    reports = await db.work_reports.find(pending_q, {"_id": 0, "id": 1}).limit(limit).to_list(limit)
+    for r in reports:
+        await _sync_work_report_now(r["id"])
+    payments = await db.payments.find(pending_q, {"_id": 0, "id": 1}).limit(limit).to_list(limit)
+    for p in payments:
+        await _sync_payment_now(p["id"])
+    return {"work_reports_processed": len(reports), "payments_processed": len(payments)}
+
+
+async def excel_sync_loop():
+    """Automatic retries — decoupled from the request path so a slow/unreachable
+    Graph API never blocks an admin's approve/pay action. The DB write already
+    succeeded before this loop ever runs; this only ever affects sync status."""
+    while True:
+        try:
+            await asyncio.sleep(EXCEL_SYNC_INTERVAL_SECONDS)
+            cfg = await db.excel_integration.find_one({"id": "global"}, {"_id": 0, "enabled": 1})
+            if not cfg or not cfg.get("enabled"):
+                continue
+            await _run_excel_sync_pass()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"Excel sync loop error (non-fatal, will retry): {e}")
+
+
+@api.post("/excel-integration/sync-now")
+async def excel_sync_now(u=Depends(require_role(Role.admin))):
+    result = await _run_excel_sync_pass(limit=200)
+    await audit(u, "sync-now", "excel_integration", "global", None, result)
+    return result
+
+
+@api.post("/excel-integration/retry/{entity_type}/{entity_id}")
+async def excel_retry_one(entity_type: str, entity_id: str, u=Depends(require_role(Role.admin))):
+    if entity_type == "work_report":
+        await db.work_reports.update_one({"id": entity_id}, {"$set": {"excel_sync_status": ExcelSyncStatus.pending.value}})
+        await _sync_work_report_now(entity_id)
+    elif entity_type == "payment":
+        await db.payments.update_one({"id": entity_id}, {"$set": {"excel_sync_status": ExcelSyncStatus.pending.value}})
+        await _sync_payment_now(entity_id)
+    else:
+        raise HTTPException(404, "Unknown entity type")
+    return {"ok": True}
+
+
+@api.get("/excel-integration/sync-status")
+async def excel_sync_status_endpoint(u=Depends(require_role(Role.admin))):
+    async def counts(coll):
+        rows = await db[coll].aggregate([{"$group": {"_id": "$excel_sync_status", "n": {"$sum": 1}}}]).to_list(10)
+        return {(r["_id"] or "Unknown"): r["n"] for r in rows}
+
+    work_counts = await counts("work_reports")
+    payment_counts = await counts("payments")
+    last_success = await db.work_reports.find(
+        {"excel_sync_status": ExcelSyncStatus.synced.value}, {"_id": 0, "excel_last_synced_at": 1},
+    ).sort("excel_last_synced_at", -1).limit(1).to_list(1)
+    failed_reports = await db.work_reports.find(
+        {"excel_sync_status": ExcelSyncStatus.failed.value},
+        {"_id": 0, "id": 1, "entry_id": 1, "worker_name": 1, "site_name": 1, "excel_last_error": 1, "excel_sync_attempts": 1},
+    ).to_list(200)
+    failed_payments = await db.payments.find(
+        {"excel_sync_status": ExcelSyncStatus.failed.value},
+        {"_id": 0, "id": 1, "worker_name": 1, "amount": 1, "excel_last_error": 1, "excel_sync_attempts": 1},
+    ).to_list(200)
+    workers = await db.workers.find(
+        {}, {"_id": 0, "id": 1, "name": 1, "first_valid_entry_at": 1, "automation_started_at": 1, "excel_match_status": 1},
+    ).to_list(1000)
+    return {
+        "work_reports": work_counts,
+        "payments": payment_counts,
+        "last_successful_sync_at": (last_success[0]["excel_last_synced_at"] if last_success else None),
+        "failed_work_reports": failed_reports,
+        "failed_payments": failed_payments,
+        "workers": [
+            {
+                "worker_id": w["id"], "name": w["name"],
+                "first_valid_entry_at": w.get("first_valid_entry_at"),
+                "automation_started_at": w.get("automation_started_at"),
+                "excel_match_status": w.get("excel_match_status") or ExcelMatchStatus.unresolved.value,
+            }
+            for w in workers
+        ],
+    }
+
+
+# --- Payment / Banking API (kept fully separate from Excel Integration) ---
+@api.get("/banking-integration/settings")
+async def get_banking_settings(u=Depends(require_role(Role.admin))):
+    cfg = await db.banking_integration.find_one({"id": "global"}, {"_id": 0}) or {}
+    return {
+        "enabled": cfg.get("enabled", False),
+        "provider_name": cfg.get("provider_name", ""),
+        "api_base_url": cfg.get("api_base_url", ""),
+        "environment": cfg.get("environment", "Sandbox"),
+        "has_api_key": bool(cfg.get("api_key_enc")),
+        "has_client_secret": bool(cfg.get("client_secret_enc")),
+        "merchant_id": cfg.get("merchant_id", ""),
+        "webhook_url": cfg.get("webhook_url", ""),
+        "has_webhook_secret": bool(cfg.get("webhook_secret_enc")),
+        "last_test_at": cfg.get("last_test_at"),
+        "last_test_ok": cfg.get("last_test_ok"),
+        "last_test_message": cfg.get("last_test_message"),
+    }
+
+
+@api.put("/banking-integration/settings")
+async def update_banking_settings(body: BankingSettingsIn, u=Depends(require_role(Role.admin))):
+    old = await db.banking_integration.find_one({"id": "global"}, {"_id": 0})
+    upd = {
+        "provider_name": body.provider_name.strip(),
+        "api_base_url": body.api_base_url.strip(),
+        "merchant_id": body.merchant_id or "",
+        "webhook_url": body.webhook_url or "",
+        "environment": body.environment if body.environment in ("Sandbox", "Production") else "Sandbox",
+        "enabled": bool(body.enabled and body.api_base_url and (body.api_key or body.client_secret)),
+        "updated_by": u["id"],
+        "updated_at": now_utc().isoformat(),
+    }
+    if body.api_key:
+        upd["api_key_enc"] = encrypt_secret(body.api_key)
+    if body.client_id:
+        upd["client_id_enc"] = encrypt_secret(body.client_id)
+    if body.client_secret:
+        upd["client_secret_enc"] = encrypt_secret(body.client_secret)
+    if body.webhook_secret:
+        upd["webhook_secret_enc"] = encrypt_secret(body.webhook_secret)
+    await db.banking_integration.update_one({"id": "global"}, {"$set": upd}, upsert=True)
+    safe_old = {k: v for k, v in (old or {}).items() if not k.endswith("_enc")}
+    safe_new = {k: v for k, v in upd.items() if not k.endswith("_enc")}
+    await audit(u, "update", "banking_integration_settings", "global", safe_old, safe_new)
+    return {"ok": True}
+
+
+@api.post("/banking-integration/test-connection")
+async def test_banking_connection(u=Depends(require_role(Role.admin))):
+    cfg = await db.banking_integration.find_one({"id": "global"}, {"_id": 0})
+    if not cfg or not cfg.get("api_base_url"):
+        raise HTTPException(400, "Set an API Base URL first")
+    api_key = decrypt_secret(cfg.get("api_key_enc"))
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    ok, msg = False, ""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as c:
+            r = await c.get(cfg["api_base_url"], headers=headers)
+        ok = r.status_code < 500
+        msg = (
+            f"Reached {cfg['api_base_url']} (HTTP {r.status_code}). This confirms network "
+            f"reachability and that credentials were sent — it does NOT confirm the provider "
+            f"accepted them, since every bank's auth handshake is different. Confirm a real "
+            f"sandbox transaction with your provider's own docs before relying on this."
+        )
+    except httpx.HTTPError as e:
+        msg = f"Could not reach {cfg['api_base_url']}: {e}"
+    await db.banking_integration.update_one({"id": "global"}, {"$set": {
+        "last_test_at": now_utc().isoformat(), "last_test_ok": ok, "last_test_message": msg,
+    }})
+    return {"ok": ok, "message": msg}
 
 
 # --- Audit log -----------------------------------------------------------
@@ -3015,6 +3748,22 @@ async def startup():
     await db.leaves.create_index([("worker_id", 1), ("status", 1)])
     await db.payment_requests.create_index([("worker_id", 1), ("status", 1)])
     await db.report_photos.create_index("report_id")
+    await db.work_reports.create_index("excel_sync_status")
+    await db.payments.create_index("excel_sync_status")
+
+    # Backfill Excel Integration system fields onto records created before this
+    # feature existed — never touches anything else on the document.
+    await db.workers.update_many({"excel_match_status": {"$exists": False}}, {"$set": {
+        "excel_party_id": None, "excel_match_status": ExcelMatchStatus.unresolved.value,
+        "automation_enabled": False, "first_valid_entry_at": None, "automation_started_at": None,
+    }})
+    await db.sites.update_many({"excel_match_status": {"$exists": False}}, {"$set": {
+        "excel_site_id": None, "excel_match_status": ExcelMatchStatus.unresolved.value,
+    }})
+    await db.door_types.update_many({"excel_match_status": {"$exists": False}}, {"$set": {
+        "excel_item_id": None, "excel_match_status": ExcelMatchStatus.unresolved.value,
+        "excel_work_category": None, "excel_specification": None,
+    }})
 
     # settings
     if not await db.settings.find_one({"id": "global"}):
@@ -3161,6 +3910,7 @@ async def startup():
             logger.info("Seeded sample report & payment")
 
     app.state.reminder_task = asyncio.create_task(reminder_loop())
+    app.state.excel_sync_task = asyncio.create_task(excel_sync_loop())
 
 
 @app.on_event("shutdown")
@@ -3168,6 +3918,9 @@ async def shutdown():
     task = getattr(app.state, "reminder_task", None)
     if task:
         task.cancel()
+    excel_task = getattr(app.state, "excel_sync_task", None)
+    if excel_task:
+        excel_task.cancel()
     client.close()
 
 

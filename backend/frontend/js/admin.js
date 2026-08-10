@@ -53,6 +53,8 @@ const MORE_TILES = [
   { key: "audit", icon: "🛡️", label: "Audit Log" },
   { key: "doortypes", icon: "🚪", label: "Door Types" },
   { key: "notifications", icon: "🔔", label: "Notifications" },
+  { key: "excel-integration", icon: "📗", label: "Excel Integration" },
+  { key: "banking-settings", icon: "🏦", label: "Payment / Banking API" },
   { key: "settings", icon: "⚙️", label: "Settings" },
   { key: "changepwd", icon: "🔑", label: "Change Password" },
 ];
@@ -63,7 +65,7 @@ async function downloadWithToken(path) {
   window.open(`/api${path}${sep}token=${encodeURIComponent(token)}`, "_blank");
 }
 
-export function renderAdmin(frame, user, logout) {
+export function renderAdmin(frame, user, logout, initialView = null) {
   frame.innerHTML = `
     <div class="content" id="content"></div>
     <nav class="bottom-nav" id="bottom-nav">
@@ -72,7 +74,9 @@ export function renderAdmin(frame, user, logout) {
   `;
   const content = frame.querySelector("#content");
   const navEl = frame.querySelector("#bottom-nav");
-  const state = { tab: "dashboard", view: "dashboard", params: {} };
+  const state = initialView
+    ? { tab: "more", view: initialView.view, params: initialView.params || {} }
+    : { tab: "dashboard", view: "dashboard", params: {} };
 
   const nav = {
     goTab(tab, params = {}) {
@@ -111,6 +115,8 @@ export function renderAdmin(frame, user, logout) {
     notifications: renderNotifications,
     "worker-performance": renderWorkerPerformance,
     search: renderGlobalSearch,
+    "excel-integration": renderExcelIntegration,
+    "banking-settings": renderBankingSettings,
     settings: renderSettings,
     changepwd: renderChangePassword,
   };
@@ -1772,6 +1778,390 @@ async function renderAudit(content, nav) {
     renderList(filtered);
   });
   renderList(logs);
+}
+
+function excelStatusBadge(status) {
+  const cls = { Matched: "badge-success", Created: "badge-success", "Create Pending": "badge-info", Unresolved: "badge-warning" }[status] || "badge-neutral";
+  return `<span class="badge ${cls}">${escapeHtml(status || "Unresolved")}</span>`;
+}
+
+const MAPPING_KINDS = [
+  { key: "worker", label: "Workers" },
+  { key: "site", label: "Sites" },
+  { key: "door_type", label: "Door Types" },
+];
+
+async function renderExcelIntegration(content, nav, logout, params = {}) {
+  const sections = ["Connection", "Mapping", "Sync Monitor"];
+  content.innerHTML = `
+    <div class="back-row">
+      <button class="icon-btn" id="back-btn">←</button>
+      <h1 class="page-title">Excel Integration</h1>
+    </div>
+    <p class="page-subtitle">Admin-only. Workers never see this screen. Connects to your OneDrive-hosted ERP workbook via Microsoft Graph — app entries sync to it, they never replace or re-import anything already in it.</p>
+    <div class="filter-pills" id="eint-pills">
+      ${sections.map((s, i) => `<button class="filter-pill ${i === 0 ? "active" : ""}" data-section="${s}">${s}</button>`).join("")}
+    </div>
+    <div id="eint-body"><div class="loading">Loading…</div></div>
+  `;
+  content.querySelector("#back-btn").addEventListener("click", () => nav.back("more"));
+  const body = content.querySelector("#eint-body");
+
+  async function loadConnection() {
+    const s = await get("/excel-integration/settings");
+    body.innerHTML = `
+      <form class="card-block" id="eint-form">
+        <label>Tenant ID (use "common" unless your org requires a specific tenant)
+          <input name="tenant_id" value="${escapeHtml(s.tenant_id || "common")}" />
+        </label>
+        <label>Client ID (from your Azure App Registration)<input name="client_id" value="${escapeHtml(s.client_id || "")}" required /></label>
+        <label>Client Secret ${s.connected ? "(leave blank to keep the current one)" : ""}<input name="client_secret" type="password" autocomplete="off" ${s.connected ? "" : "required"} /></label>
+        <label>Workbook path in OneDrive<input name="workbook_file_path" placeholder="/Documents/JONAH ENTERPRISES-ERP-2026-FINAL.xlsm" value="${escapeHtml(s.workbook_file_path || "")}" required /></label>
+        <label>Redirect URI (must exactly match what's registered in Azure)<input name="redirect_uri" placeholder="${location.origin}/api/excel-integration/oauth/callback" value="${escapeHtml(s.redirect_uri || location.origin + "/api/excel-integration/oauth/callback")}" required /></label>
+        <div class="error" id="eint-error"></div>
+        <button type="submit" class="pill-btn">Save Settings</button>
+      </form>
+      <div class="card-block">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div>
+            <div class="list-card-title">${s.connected ? "Connected" : "Not connected"}</div>
+            <div class="list-card-sub">${s.workbook_name ? "Workbook: " + escapeHtml(s.workbook_name) : "No workbook resolved yet"}</div>
+            ${s.last_connection_test_message ? `<div class="list-card-meta">${escapeHtml(s.last_connection_test_message)}</div>` : ""}
+          </div>
+          ${s.connected ? statusBadge("Active") : statusBadge("Disabled")}
+        </div>
+        <div class="actions" style="display:flex;gap:0.5rem;margin-top:0.75rem;flex-wrap:wrap">
+          <button class="pill-btn pill-btn-sm" id="eint-connect-btn">${s.connected ? "Reconnect" : "Connect Microsoft OneDrive"}</button>
+          <button class="pill-btn outline pill-btn-sm" id="eint-test-btn">Test Connection</button>
+          ${s.connected ? `<button class="pill-btn outline pill-btn-sm text-danger" id="eint-disconnect-btn">Disconnect</button>` : ""}
+        </div>
+      </div>
+      <details class="card-block">
+        <summary>One-time Azure setup (only needs doing once)</summary>
+        <p class="page-subtitle" style="margin-top:0.5rem">
+          In the Azure Portal: create an App Registration → add a Web redirect URI matching the one above →
+          under API permissions add Microsoft Graph delegated <code>Files.ReadWrite</code> and <code>offline_access</code> →
+          create a Client Secret and paste it here along with the Application (client) ID.
+        </p>
+      </details>
+    `;
+    body.querySelector("#eint-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const errorEl = body.querySelector("#eint-error");
+      errorEl.textContent = "";
+      const fd = new FormData(e.target);
+      const btn = e.target.querySelector('button[type="submit"]');
+      btn.disabled = true;
+      try {
+        await put("/excel-integration/settings", {
+          tenant_id: fd.get("tenant_id"),
+          client_id: fd.get("client_id"),
+          client_secret: fd.get("client_secret") || (s.connected ? "keep" : ""),
+          workbook_file_path: fd.get("workbook_file_path"),
+          redirect_uri: fd.get("redirect_uri"),
+        });
+        showMessage(content, "Settings saved", "success");
+      } catch (err) {
+        errorEl.textContent = err.message;
+      } finally {
+        btn.disabled = false;
+      }
+    });
+    body.querySelector("#eint-connect-btn").addEventListener("click", async () => {
+      try {
+        const { url } = await get("/excel-integration/oauth/start");
+        window.location.href = url;
+      } catch (err) {
+        showMessage(content, err.message, "error");
+      }
+    });
+    body.querySelector("#eint-test-btn").addEventListener("click", async (e) => {
+      e.target.disabled = true;
+      try {
+        const result = await post("/excel-integration/test-connection", {});
+        showMessage(content, result.message, result.ok ? "success" : "error");
+      } catch (err) {
+        showMessage(content, err.message, "error");
+      } finally {
+        e.target.disabled = false;
+        loadConnection();
+      }
+    });
+    body.querySelector("#eint-disconnect-btn")?.addEventListener("click", async () => {
+      if (!confirm("Disconnect Excel Integration? Automatic sync stops until you reconnect.")) return;
+      await post("/excel-integration/disconnect", {});
+      loadConnection();
+    });
+  }
+
+  async function loadMapping() {
+    body.innerHTML = `
+      <div class="filter-pills" id="mapping-pills">
+        ${MAPPING_KINDS.map((k, i) => `<button class="filter-pill ${i === 0 ? "active" : ""}" data-kind="${k.key}">${k.label}</button>`).join("")}
+      </div>
+      <div id="mapping-list"><div class="loading">Loading…</div></div>
+    `;
+    const listEl = body.querySelector("#mapping-list");
+    async function loadKind(kind) {
+      listEl.innerHTML = '<div class="loading">Loading…</div>';
+      try {
+        const { matched_count, unresolved } = await get(`/excel-integration/mapping/${kind}`);
+        listEl.innerHTML = `
+          <p class="page-subtitle">${matched_count} already linked to Excel. ${unresolved.length} need your confirmation before their work/payments can sync.</p>
+          ${
+            unresolved
+              .map(
+                (item, i) => `
+            <div class="list-card" style="flex-direction:column;align-items:stretch">
+              <div class="list-card-title">${escapeHtml(item.name || item.site_name || "-")}</div>
+              ${item.suggestions?.length ? `<div class="list-card-sub">Possible match: ${item.suggestions.map((s) => `${escapeHtml(s.name || "")} (${escapeHtml(s.excel_id || "")})`).join(", ")}</div>` : `<div class="list-card-sub">No obvious match found in Excel</div>`}
+              <div class="actions" style="display:flex;gap:0.5rem;margin-top:0.5rem;flex-wrap:wrap">
+                <button class="pill-btn pill-btn-sm" data-idx="${i}" data-action="link">Link to Excel ID…</button>
+                <button class="pill-btn outline pill-btn-sm" data-idx="${i}" data-action="create">This is new — create in Excel</button>
+              </div>
+            </div>
+          `
+              )
+              .join("") || '<div class="empty-state"><div class="title">Nothing to resolve</div>Every record is linked.</div>'
+          }
+        `;
+        listEl.querySelectorAll('[data-action="link"]').forEach((btn) => {
+          btn.addEventListener("click", async () => {
+            const item = unresolved[Number(btn.dataset.idx)];
+            const excelId = prompt(
+              `Excel ID to link "${item.name || item.site_name}" to:` +
+                (item.suggestions?.length ? `\nSuggested: ${item.suggestions.map((s) => s.excel_id).join(", ")}` : ""),
+              item.suggestions?.[0]?.excel_id || ""
+            );
+            if (!excelId) return;
+            btn.disabled = true;
+            try {
+              await post(`/excel-integration/mapping/${kind}/${item.id}/confirm`, { excel_id: excelId });
+              loadKind(kind);
+            } catch (err) {
+              showMessage(content, err.message, "error");
+              btn.disabled = false;
+            }
+          });
+        });
+        listEl.querySelectorAll('[data-action="create"]').forEach((btn) => {
+          btn.addEventListener("click", async () => {
+            const item = unresolved[Number(btn.dataset.idx)];
+            if (!confirm(`Confirm "${item.name || item.site_name}" has no existing Excel record — a new one will be created automatically.`)) return;
+            btn.disabled = true;
+            try {
+              await post(`/excel-integration/mapping/${kind}/${item.id}/confirm`, { create_new: true });
+              loadKind(kind);
+            } catch (err) {
+              showMessage(content, err.message, "error");
+              btn.disabled = false;
+            }
+          });
+        });
+      } catch (err) {
+        listEl.innerHTML = "";
+        showMessage(content, err.message, "error");
+      }
+    }
+    body.querySelector("#mapping-pills").querySelectorAll("button").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        body.querySelectorAll(".filter-pill").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        loadKind(btn.dataset.kind);
+      });
+    });
+    loadKind("worker");
+  }
+
+  async function loadMonitor() {
+    body.innerHTML = '<div class="loading">Loading…</div>';
+    const s = await get("/excel-integration/sync-status");
+    const wr = s.work_reports || {};
+    const py = s.payments || {};
+    body.innerHTML = `
+      <div class="stat-grid cols-3">
+        <div class="stat-tile"><div class="stat-tile-label">Work Reports Synced</div><div class="stat-tile-value">${wr.Synced || 0}</div></div>
+        <div class="stat-tile"><div class="stat-tile-label">Pending</div><div class="stat-tile-value">${wr.Pending || 0}</div></div>
+        <div class="stat-tile"><div class="stat-tile-label">Failed</div><div class="stat-tile-value">${wr.Failed || 0}</div></div>
+        <div class="stat-tile"><div class="stat-tile-label">Payments Synced</div><div class="stat-tile-value">${py.Synced || 0}</div></div>
+        <div class="stat-tile"><div class="stat-tile-label">Pending</div><div class="stat-tile-value">${py.Pending || 0}</div></div>
+        <div class="stat-tile"><div class="stat-tile-label">Failed</div><div class="stat-tile-value">${py.Failed || 0}</div></div>
+      </div>
+      <p class="page-subtitle">Last successful sync: ${s.last_successful_sync_at ? formatDateTime(s.last_successful_sync_at) : "never"}</p>
+      <button class="pill-btn" id="sync-now-btn">Sync Now</button>
+
+      <div class="section-label">Failed Work Reports</div>
+      ${
+        s.failed_work_reports
+          .map(
+            (r) => `
+        <div class="list-card">
+          <div class="list-card-body">
+            <div class="list-card-title">${escapeHtml(r.entry_id || r.id)} — ${escapeHtml(r.worker_name || "")}</div>
+            <div class="list-card-sub">${escapeHtml(r.site_name || "")}</div>
+            <div class="list-card-meta">${escapeHtml(r.excel_last_error || "")} (${r.excel_sync_attempts} attempt(s))</div>
+          </div>
+          <button class="pill-btn outline pill-btn-sm" data-type="work_report" data-id="${r.id}">Retry</button>
+        </div>
+      `
+          )
+          .join("") || '<div class="empty-state">None</div>'
+      }
+
+      <div class="section-label">Failed Payments</div>
+      ${
+        s.failed_payments
+          .map(
+            (p) => `
+        <div class="list-card">
+          <div class="list-card-body">
+            <div class="list-card-title">${escapeHtml(p.worker_name || "")}</div>
+            <div class="list-card-meta">${escapeHtml(p.excel_last_error || "")} (${p.excel_sync_attempts} attempt(s))</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:0.5rem">
+            <div class="list-card-amount">${money(p.amount)}</div>
+            <button class="pill-btn outline pill-btn-sm" data-type="payment" data-id="${p.id}">Retry</button>
+          </div>
+        </div>
+      `
+          )
+          .join("") || '<div class="empty-state">None</div>'
+      }
+
+      <div class="section-label">Per-Worker Automation</div>
+      ${s.workers
+        .map(
+          (w) => `
+        <div class="list-card">
+          <div class="list-card-body">
+            <div class="list-card-title">${escapeHtml(w.name)}</div>
+            <div class="list-card-sub">First valid entry: ${w.first_valid_entry_at ? formatDateTime(w.first_valid_entry_at) : "—"} · Automation started: ${w.automation_started_at ? formatDateTime(w.automation_started_at) : "—"}</div>
+          </div>
+          ${excelStatusBadge(w.excel_match_status)}
+        </div>
+      `
+        )
+        .join("")}
+    `;
+    body.querySelector("#sync-now-btn").addEventListener("click", async (e) => {
+      e.target.disabled = true;
+      e.target.textContent = "Syncing…";
+      try {
+        await post("/excel-integration/sync-now", {});
+        loadMonitor();
+      } catch (err) {
+        showMessage(content, err.message, "error");
+        e.target.disabled = false;
+        e.target.textContent = "Sync Now";
+      }
+    });
+    body.querySelectorAll("[data-type][data-id]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        try {
+          await post(`/excel-integration/retry/${btn.dataset.type}/${btn.dataset.id}`, {});
+          loadMonitor();
+        } catch (err) {
+          showMessage(content, err.message, "error");
+          btn.disabled = false;
+        }
+      });
+    });
+  }
+
+  const loaders = { Connection: loadConnection, Mapping: loadMapping, "Sync Monitor": loadMonitor };
+  content.querySelector("#eint-pills").querySelectorAll("button").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      content.querySelectorAll("#eint-pills .filter-pill").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      loaders[btn.dataset.section]();
+    });
+  });
+  await loadConnection();
+  if (params.excelConnected === "1") {
+    showMessage(content, "Excel Integration connected.", "success");
+  } else if (params.excelConnected === "0") {
+    showMessage(content, params.msg || "Connection failed.", "error");
+  }
+}
+
+async function renderBankingSettings(content, nav) {
+  const s = await get("/banking-integration/settings");
+  content.innerHTML = `
+    <div class="back-row">
+      <button class="icon-btn" id="back-btn">←</button>
+      <h1 class="page-title">Payment / Banking API</h1>
+    </div>
+    <p class="page-subtitle">Kept completely separate from Excel Integration. Configuring this does NOT enable automatic bank transfers yet — every payment still goes through the manual Record Payment flow (Payment Requests screen) until a real transfer-initiation endpoint is added once you have live provider credentials. Until then, this only stores connection details and lets you verify reachability.</p>
+    <form class="card-block" id="bank-form">
+      <label>Provider Name<input name="provider_name" placeholder="e.g. IndusInd Bank" value="${escapeHtml(s.provider_name || "")}" /></label>
+      <label>API Base URL<input name="api_base_url" placeholder="https://api.yourbank.com" value="${escapeHtml(s.api_base_url || "")}" /></label>
+      <label>Environment
+        <select name="environment">
+          <option value="Sandbox" ${s.environment === "Sandbox" ? "selected" : ""}>Sandbox</option>
+          <option value="Production" ${s.environment === "Production" ? "selected" : ""}>Production</option>
+        </select>
+      </label>
+      <label>API Key ${s.has_api_key ? "(set — leave blank to keep it)" : ""}<input name="api_key" type="password" autocomplete="off" /></label>
+      <label>Client ID<input name="client_id" placeholder="optional, provider-specific" /></label>
+      <label>Client Secret ${s.has_client_secret ? "(set — leave blank to keep it)" : ""}<input name="client_secret" type="password" autocomplete="off" /></label>
+      <label>Merchant ID<input name="merchant_id" value="${escapeHtml(s.merchant_id || "")}" /></label>
+      <label>Webhook URL<input name="webhook_url" value="${escapeHtml(s.webhook_url || "")}" /></label>
+      <label>Webhook Secret ${s.has_webhook_secret ? "(set — leave blank to keep it)" : ""}<input name="webhook_secret" type="password" autocomplete="off" /></label>
+      <label class="checklist-row"><input type="checkbox" name="enabled" ${s.enabled ? "checked" : ""} /> Enabled</label>
+      <div class="error" id="bank-error"></div>
+      <button type="submit" class="pill-btn">Save Settings</button>
+    </form>
+    <div class="card-block">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <div class="list-card-title">${s.enabled ? "Enabled" : "Not enabled"}</div>
+          ${s.last_test_message ? `<div class="list-card-meta">${escapeHtml(s.last_test_message)}</div>` : ""}
+        </div>
+        ${s.enabled ? statusBadge("Active") : statusBadge("Disabled")}
+      </div>
+      <button class="pill-btn outline pill-btn-sm" id="bank-test-btn" style="margin-top:0.75rem">Test Connection</button>
+    </div>
+  `;
+  content.querySelector("#back-btn").addEventListener("click", () => nav.back("more"));
+  content.querySelector("#bank-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const errorEl = content.querySelector("#bank-error");
+    errorEl.textContent = "";
+    const fd = new FormData(e.target);
+    const btn = e.target.querySelector('button[type="submit"]');
+    btn.disabled = true;
+    try {
+      await put("/banking-integration/settings", {
+        provider_name: fd.get("provider_name") || "",
+        api_base_url: fd.get("api_base_url") || "",
+        environment: fd.get("environment"),
+        api_key: fd.get("api_key") || "",
+        client_id: fd.get("client_id") || "",
+        client_secret: fd.get("client_secret") || "",
+        merchant_id: fd.get("merchant_id") || "",
+        webhook_url: fd.get("webhook_url") || "",
+        webhook_secret: fd.get("webhook_secret") || "",
+        enabled: fd.get("enabled") === "on",
+      });
+      showMessage(content, "Settings saved", "success");
+    } catch (err) {
+      errorEl.textContent = err.message;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+  content.querySelector("#bank-test-btn").addEventListener("click", async (e) => {
+    e.target.disabled = true;
+    try {
+      const result = await post("/banking-integration/test-connection", {});
+      showMessage(content, result.message, result.ok ? "success" : "error");
+    } catch (err) {
+      showMessage(content, err.message, "error");
+    } finally {
+      e.target.disabled = false;
+    }
+  });
 }
 
 async function renderSettings(content, nav) {

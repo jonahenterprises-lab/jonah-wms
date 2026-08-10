@@ -57,7 +57,14 @@ function renderShell(user) {
   root.appendChild(shell);
 
   if (user.role === "Admin") {
-    renderAdmin(frame, user, logout);
+    const qp = new URLSearchParams(location.search);
+    const excelConnected = qp.get("excel_connected");
+    let initialView = null;
+    if (excelConnected !== null) {
+      initialView = { view: "excel-integration", params: { excelConnected, msg: qp.get("msg") } };
+      history.replaceState(null, "", location.pathname);
+    }
+    renderAdmin(frame, user, logout, initialView);
   } else if (user.role === "Worker") {
     renderWorker(frame, user, logout);
   } else {

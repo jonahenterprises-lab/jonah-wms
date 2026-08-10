@@ -1596,6 +1596,14 @@ async def payout_preview(u=Depends(require_role(Role.admin))):
         {"$group": {"_id": "$worker_id", "total": {"$sum": "$amount"},
                     "last_date": {"$max": "$payment_date"}}}
     ]).to_list(1000)}
+    # One query for everyone's recent payment methods instead of one query per
+    # worker inside the loop below — $group's $push preserves the order of the
+    # preceding $sort, so each worker's array is already most-recent-first.
+    methods_agg = await db.payments.aggregate([
+        {"$sort": {"payment_date": -1}},
+        {"$group": {"_id": "$worker_id", "methods": {"$push": "$payment_method"}}},
+    ]).to_list(1000)
+    methods_by_worker = {r["_id"]: [m for m in r["methods"][:5] if m] for r in methods_agg}
     workers = await db.workers.find({"status": "Active"}, {"_id": 0}).to_list(1000)
     rows = []
     for w in workers:
@@ -1604,9 +1612,8 @@ async def payout_preview(u=Depends(require_role(Role.admin))):
         pending = round(a - p, 2)
         if pending <= 0:
             continue
-        # find preferred method = most-used in last 5 payments
-        last_pays = await db.payments.find({"worker_id": w["id"]}, {"_id": 0, "payment_method": 1}).sort("payment_date", -1).limit(5).to_list(5)
-        methods = [p["payment_method"] for p in last_pays if p.get("payment_method")]
+        # preferred method = most-used among the worker's last 5 payments
+        methods = methods_by_worker.get(w["id"], [])
         preferred = max(set(methods), key=methods.count) if methods else "UPI"
         rows.append({
             "worker_id": w["id"],
@@ -2234,25 +2241,27 @@ async def admin_charts(u=Depends(require_role(Role.admin))):
     months.reverse()
     month_start = months[0] + "-01"
 
-    # Monthly doors (approved reports only for accounting truth)
+    # Monthly doors (approved reports only for accounting truth) — grouped in
+    # Mongo rather than pulled document-by-document into Python, consistent with
+    # the top-workers/site-installations aggregations just below.
     doors_by_month = {mm: 0 for mm in months}
-    async for r in db.work_reports.find(
-        {"approval_status": "Approved", "work_date": {"$gte": month_start}},
-        {"_id": 0, "work_date": 1, "door_count": 1},
-    ):
-        key = (r.get("work_date") or "")[:7]
-        if key in doors_by_month:
-            doors_by_month[key] += r.get("door_count", 0)
+    doors_agg = await db.work_reports.aggregate([
+        {"$match": {"approval_status": "Approved", "work_date": {"$gte": month_start}}},
+        {"$group": {"_id": {"$substrCP": ["$work_date", 0, 7]}, "doors": {"$sum": "$door_count"}}},
+    ]).to_list(100)
+    for d in doors_agg:
+        if d["_id"] in doors_by_month:
+            doors_by_month[d["_id"]] = d["doors"]
 
     # Monthly payments
     pay_by_month = {mm: 0.0 for mm in months}
-    async for p in db.payments.find(
-        {"payment_date": {"$gte": month_start}},
-        {"_id": 0, "payment_date": 1, "amount": 1},
-    ):
-        key = (p.get("payment_date") or "")[:7]
-        if key in pay_by_month:
-            pay_by_month[key] += float(p.get("amount", 0))
+    pay_agg = await db.payments.aggregate([
+        {"$match": {"payment_date": {"$gte": month_start}}},
+        {"$group": {"_id": {"$substrCP": ["$payment_date", 0, 7]}, "amount": {"$sum": "$amount"}}},
+    ]).to_list(100)
+    for p in pay_agg:
+        if p["_id"] in pay_by_month:
+            pay_by_month[p["_id"]] = float(p["amount"])
 
     # Top workers by approved doors
     top_workers_agg = await db.work_reports.aggregate([
@@ -2304,11 +2313,16 @@ async def _rpt_worker_earnings(date_from: Optional[str], date_to: Optional[str],
         by_worker[wid]["amount"] += float(r.get("total_amount", 0))
         totals["doors"] += r.get("door_count", 0)
         totals["amount"] += float(r.get("total_amount", 0))
+    # One grouped query for every worker's all-time paid total instead of one
+    # query per worker inside the loop below.
+    worker_ids = list(by_worker.keys())
+    paid_agg = await db.payments.aggregate([
+        {"$match": {"worker_id": {"$in": worker_ids}}},
+        {"$group": {"_id": "$worker_id", "total": {"$sum": "$amount"}}},
+    ]).to_list(1000) if worker_ids else []
+    paid_by_worker = {r["_id"]: float(r["total"]) for r in paid_agg}
     for wid, v in by_worker.items():
-        # attach paid & pending
-        paid = 0.0
-        async for p in db.payments.find({"worker_id": wid}, {"_id": 0, "amount": 1}):
-            paid += float(p.get("amount", 0))
+        paid = paid_by_worker.get(wid, 0.0)
         rows.append([v["worker"], v["doors"], _rupees(v["amount"]), _rupees(paid), _rupees(v["amount"] - paid)])
     header = ["Worker", "Doors", "Approved Amount", "Paid", "Pending"]
     footer = ["TOTAL", totals["doors"], _rupees(totals["amount"]), "", ""]
@@ -2729,6 +2743,10 @@ async def startup():
     await db.attendance_sessions.create_index([("worker_id", 1), ("check_in_time", -1)])
     await db.attendance_sessions.create_index([("site_id", 1), ("check_in_time", -1)])
     await db.attendance_sessions.create_index("check_out_time")
+    # Standalone index: the dashboard's "checked in today"/"sites today" queries
+    # filter on check_in_time alone, which can't use either compound index above
+    # as a prefix (both lead with worker_id/site_id first).
+    await db.attendance_sessions.create_index("check_in_time")
     await db.payments.create_index([("worker_id", 1), ("payment_date", -1)])
     await db.notifications.create_index([("user_id", 1), ("created_at", -1)])
     await db.leaves.create_index([("worker_id", 1), ("status", 1)])

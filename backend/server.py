@@ -136,14 +136,14 @@ class WorkerIn(BaseModel):
     username: str
     password: str = Field(min_length=8)
     joining_date: Optional[str] = None
-    default_rate: float = 250.0
+    default_rate: float = Field(default=250.0, gt=0)
     notes: Optional[str] = ""
 
 
 class WorkerUpdate(BaseModel):
     name: Optional[str] = None
     mobile: Optional[str] = None
-    default_rate: Optional[float] = None
+    default_rate: Optional[float] = Field(default=None, gt=0)
     status: Optional[str] = None
     notes: Optional[str] = None
 
@@ -234,7 +234,7 @@ class SettingsIn(BaseModel):
     mobile: Optional[str] = None
     email: Optional[str] = None
     currency: Optional[str] = None
-    default_rate: Optional[float] = None
+    default_rate: Optional[float] = Field(default=None, gt=0)
     logo_base64: Optional[str] = None
     shift_start_time: Optional[str] = None  # "HH:MM", IST — unset disables late flagging
     shift_end_time: Optional[str] = None  # "HH:MM", IST — unset disables early-leave flagging
@@ -646,6 +646,9 @@ async def list_door_types(u=Depends(get_user), status_f: Optional[str] = Query(N
 
 @api.post("/door-types")
 async def create_door_type(body: DoorTypeIn, u=Depends(require_role(Role.admin))):
+    existing = await db.door_types.find_one({"name": {"$regex": f"^{re.escape(body.name.strip())}$", "$options": "i"}})
+    if existing:
+        raise HTTPException(400, f'A door type named "{existing["name"]}" already exists')
     doc = body.dict()
     doc["id"] = str(uuid.uuid4())
     doc["created_at"] = now_utc().isoformat()
@@ -659,6 +662,12 @@ async def update_door_type(door_type_id: str, body: DoorTypeIn, u=Depends(requir
     old = await db.door_types.find_one({"id": door_type_id}, {"_id": 0})
     if not old:
         raise HTTPException(404, "Door type not found")
+    dupe = await db.door_types.find_one({
+        "id": {"$ne": door_type_id},
+        "name": {"$regex": f"^{re.escape(body.name.strip())}$", "$options": "i"},
+    })
+    if dupe:
+        raise HTTPException(400, f'A door type named "{dupe["name"]}" already exists')
     upd = body.dict()
     await db.door_types.update_one({"id": door_type_id}, {"$set": upd})
     await audit(u, "update", "door_type", door_type_id, old, upd)
@@ -1557,6 +1566,10 @@ def _validate_shift_time(value: Optional[str], label: str):
 async def update_settings(body: SettingsIn, u=Depends(require_role(Role.admin))):
     _validate_shift_time(body.shift_start_time, "Shift start")
     _validate_shift_time(body.shift_end_time, "Shift end")
+    if body.logo_base64:
+        if _photo_too_large(body.logo_base64):
+            raise HTTPException(400, "Logo exceeds the size limit (~9MB)")
+        _validate_photo(body.logo_base64, "Logo")
     old = await db.settings.find_one({"id": "global"}, {"_id": 0})
     upd = {k: v for k, v in body.dict().items() if v is not None}
     await db.settings.update_one({"id": "global"}, {"$set": upd}, upsert=True)
@@ -1855,7 +1868,7 @@ class InvoiceIn(BaseModel):
     invoice_date: Optional[str] = None
     due_date: Optional[str] = None
     items: List[InvoiceItemIn]
-    gst_rate: float = 18.0  # percent
+    gst_rate: float = Field(default=18.0, ge=0, le=100)  # percent
     notes: Optional[str] = ""
 
 

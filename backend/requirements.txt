@@ -5,8 +5,10 @@ pymongo
 certifi
 python-dotenv
 pyjwt
-passlib[bcrypt]
-bcrypt<4.1  # passlib 1.7.4's bcrypt backend detection breaks on bcrypt>=4.1
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1  # pinned exactly, not just <4.1 — passlib 1.7.4's bcrypt backend
+               # detection is version-sensitive enough that even an in-range patch
+               # bump has broken password verification for every account at once
 pydantic
 httpx
 Pillow
